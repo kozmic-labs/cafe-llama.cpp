@@ -8,6 +8,7 @@
 #include "llama.h"
 
 #include "../src/llama-arch.h"
+#include "../src/llama-hparams.h"
 #include "../src/llama-model-saver.h"
 
 #include <nlohmann/json.hpp>
@@ -307,6 +308,9 @@ struct st_plan {
     std::vector<st_ref> stack_src;  // one scalar source per entry of a stacked sidecar
     int           stack_reciprocal = 0;
     int           split_rows = 0;   // a flat source that the architecture reads as rows
+    int           kv_split = 0;     // 1: k rows, 2: v rows of a combined MLA kv_b projection
+    int64_t       kv_nope = 0;      // query/key head width without the rotary part
+    int64_t       kv_v = 0;         // value head width
     int           verbatim = 0;     // data is stored as-is in the shard and read directly by the loader
     int           exl3 = 0;         // exl3 quantized weight: trellis indices plus per row and column factors
     int64_t       exl3_bits = 0;    // width of one trellis index
@@ -389,6 +393,7 @@ struct st_map {
     int split_rows = 0; // a flat source that the architecture reads as that many rows
     enum st_reorder_kind reorder = ST_RE_NONE;
     int fused = 0;      // experts fused in a single 3d tensor: 1 gate and up, 2 down
+    int kv_split = 0;   // the combined MLA kv_b projection splits into attn_k_b and attn_v_b
 };
 
 // returns false when the tensor is not part of the text model
@@ -933,6 +938,194 @@ static void st_add_meta_vocab(gguf_context * meta, const fs::path & dir, const j
     }
 }
 
+// the xing family ships a plain sentencepiece tokenizer, so its vocabulary is
+// read from tokenizer.model instead of the byte pair encoding files
+static uint64_t st_pb_varint(const uint8_t * p, size_t n, size_t & i) {
+    uint64_t v = 0;
+    int shift = 0;
+    while (i < n) {
+        const uint8_t b = p[i++];
+        v |= (uint64_t) (b & 0x7f) << shift;
+        if ((b & 0x80) == 0) {
+            break;
+        }
+        shift += 7;
+    }
+    return v;
+}
+
+static void st_pb_skip(const uint8_t * p, size_t n, size_t & i, uint32_t wire) {
+    switch (wire) {
+        case 0: st_pb_varint(p, n, i);         break;
+        case 1: i += 8;                        break;
+        case 2: i += st_pb_varint(p, n, i);    break;
+        case 5: i += 4;                        break;
+        default: throw std::runtime_error("unsupported protobuf wire type in tokenizer.model");
+    }
+    if (i > n) {
+        throw std::runtime_error("truncated tokenizer.model");
+    }
+}
+
+struct st_spm_piece {
+    std::string piece;
+    float       score = 0.0f;
+    int         type  = 1;
+};
+
+// sentencepiece ModelProto: field 1 holds the pieces, each with a piece string (1),
+// a score (2, fixed32) and a type (3, varint)
+static std::vector<st_spm_piece> st_read_spm_pieces(const fs::path & path) {
+    const std::string data = st_read_text_file(path);
+    const uint8_t * p = (const uint8_t *) data.data();
+    const size_t n = data.size();
+    size_t i = 0;
+
+    std::vector<st_spm_piece> pieces;
+    while (i < n) {
+        const uint64_t tag = st_pb_varint(p, n, i);
+        const uint32_t field = (uint32_t) (tag >> 3);
+        const uint32_t wire  = (uint32_t) (tag & 7);
+        if (field == 1 && wire == 2) {
+            const uint64_t len = st_pb_varint(p, n, i);
+            if (i + len > n) {
+                throw std::runtime_error("truncated tokenizer.model");
+            }
+            const uint8_t * q = p + i;
+            size_t j = 0;
+            st_spm_piece sp;
+            while (j < len) {
+                const uint64_t t2 = st_pb_varint(q, len, j);
+                const uint32_t f2 = (uint32_t) (t2 >> 3);
+                const uint32_t w2 = (uint32_t) (t2 & 7);
+                if (f2 == 1 && w2 == 2) {
+                    const uint64_t sl = st_pb_varint(q, len, j);
+                    if (j + sl > len) {
+                        throw std::runtime_error("truncated tokenizer.model");
+                    }
+                    sp.piece.assign((const char *) (q + j), sl);
+                    j += sl;
+                } else if (f2 == 2 && w2 == 5) {
+                    memcpy(&sp.score, q + j, sizeof(sp.score));
+                    j += 4;
+                } else if (f2 == 3 && w2 == 0) {
+                    sp.type = (int) st_pb_varint(q, len, j);
+                } else {
+                    st_pb_skip(q, len, j, w2);
+                }
+            }
+            pieces.push_back(std::move(sp));
+            i += len;
+        } else {
+            st_pb_skip(p, n, i, wire);
+        }
+    }
+    return pieces;
+}
+
+static void st_add_meta_vocab_spm(gguf_context * meta, const fs::path & dir, const json & cfg) {
+    const json & tc = cfg.contains("text_config") ? cfg.at("text_config") : cfg;
+
+    const std::vector<st_spm_piece> pieces = st_read_spm_pieces(dir / "tokenizer.model");
+    uint32_t n_vocab = st_json_value(tc, "vocab_size", st_json_value(cfg, "vocab_size", 0u));
+    n_vocab = std::max<uint32_t>(n_vocab, (uint32_t) pieces.size());
+
+    std::vector<std::string> tokens(n_vocab);
+    std::vector<float>       scores(n_vocab, -10000.0f);
+    std::vector<int32_t>     types(n_vocab, 5); // UNUSED
+    for (uint32_t i = 0; i < n_vocab; ++i) {
+        tokens[i] = "[PAD" + std::to_string(i) + "]";
+    }
+    for (size_t i = 0; i < pieces.size() && i < n_vocab; ++i) {
+        tokens[i] = pieces[i].piece;
+        scores[i] = pieces[i].score;
+        types[i]  = pieces[i].type;
+    }
+
+    // added tokens override the pieces; special ones keep their content, the rest
+    // pre-normalize the sentencepiece space like the converter does
+    const json tokc_cfg = st_read_json(dir / "tokenizer_config.json");
+    if (tokc_cfg.contains("added_tokens_decoder")) {
+        for (const auto & [key, value] : tokc_cfg.at("added_tokens_decoder").items()) {
+            const int64_t id = atoll(key.c_str());
+            if (id < 0 || id >= (int64_t) n_vocab) {
+                continue;
+            }
+            std::string content = st_json_value(value, "content", std::string());
+            const bool special = st_json_value(value, "special", false);
+            if (!special) {
+                std::string tmp;
+                for (size_t k = 0; k < content.size();) {
+                    if (k + 2 < content.size() && (uint8_t) content[k] == 0xe2 &&
+                        (uint8_t) content[k + 1] == 0x96 && (uint8_t) content[k + 2] == 0x81) {
+                        tmp += ' ';
+                        k += 3;
+                    } else {
+                        tmp += content[k++];
+                    }
+                }
+                content.swap(tmp);
+            }
+            tokens[id] = content;
+            scores[id] = -1000.0f;
+            types[id]  = special ? 3 : 4; // CONTROL : USER_DEFINED
+        }
+    }
+
+    llama_model_saver ms(LLM_ARCH_XING4_0, meta);
+    const LLM_KV kv(LLM_ARCH_XING4_0);
+
+    ms.add_kv(LLM_KV_TOKENIZER_MODEL,  "llama");
+    ms.add_kv(LLM_KV_TOKENIZER_PRE,    "default");
+    ms.add_kv(LLM_KV_TOKENIZER_LIST,   tokens);
+    ms.add_kv(LLM_KV_TOKENIZER_SCORES, scores);
+    gguf_set_arr_data(meta, kv(LLM_KV_TOKENIZER_TOKEN_TYPE).c_str(), GGUF_TYPE_INT32, types.data(), types.size());
+
+    std::unordered_map<std::string, uint32_t> token_ids;
+    for (uint32_t i = 0; i < n_vocab; ++i) {
+        token_ids.emplace(tokens[i], i);
+    }
+    auto special_id = [&](const char * key, uint32_t def) {
+        if (!tokc_cfg.contains(key) || tokc_cfg.at(key).is_null()) {
+            return def;
+        }
+        const json & v = tokc_cfg.at(key);
+        const std::string name = v.is_string() ? v.get<std::string>() : st_json_value(v, "content", std::string());
+        const auto it = token_ids.find(name);
+        return it == token_ids.end() ? def : it->second;
+    };
+    auto config_id = [&](const char * key, uint32_t def) {
+        if (!tc.contains(key) || tc.at(key).is_null()) {
+            return def;
+        }
+        const json & v = tc.at(key);
+        return v.is_array() ? (v.empty() ? def : v.at(0).get<uint32_t>()) : v.get<uint32_t>();
+    };
+
+    const uint32_t eos = special_id("eos_token", config_id("eos_token_id", 0));
+    const uint32_t pad = special_id("pad_token", config_id("pad_token_id", eos));
+    const uint32_t bos = special_id("bos_token", config_id("bos_token_id", eos));
+    const uint32_t unk = special_id("unk_token", 0);
+
+    ms.add_kv(LLM_KV_TOKENIZER_BOS_ID,  bos);
+    ms.add_kv(LLM_KV_TOKENIZER_EOS_ID,  eos);
+    ms.add_kv(LLM_KV_TOKENIZER_PAD_ID,  pad);
+    ms.add_kv(LLM_KV_TOKENIZER_UNK_ID,  unk);
+    ms.add_kv(LLM_KV_TOKENIZER_ADD_BOS, st_json_value(tokc_cfg, "add_bos_token", false));
+    ms.add_kv(LLM_KV_TOKENIZER_ADD_EOS, st_json_value(tokc_cfg, "add_eos_token", false));
+
+    const fs::path tmpl = dir / "chat_template.jinja";
+    if (fs::is_regular_file(tmpl)) {
+        ms.add_kv(LLM_KV_TOKENIZER_CHAT_TEMPLATE, st_read_text_file(tmpl).c_str());
+    } else if (tokc_cfg.contains("chat_template")) {
+        const json & t = tokc_cfg.at("chat_template");
+        const json & first = t.is_array() ? (t.empty() ? t : t.at(0)) : t;
+        if (first.is_string()) {
+            ms.add_kv(LLM_KV_TOKENIZER_CHAT_TEMPLATE, first.get<std::string>().c_str());
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // tensor data
 // ---------------------------------------------------------------------------
@@ -1171,6 +1364,72 @@ static void st_emit_matrix(
     emit_rows((n_threads - 1) * rows_per_thread, nrows);
     for (auto & w : workers) {
         w.join();
+    }
+}
+
+// the combined kv_b projection of an MLA layer, split per head into the absorbed
+// key and value weights; both are a transpose of the checkpoint's per head block
+static void st_emit_kv_proj(const st_loader & L, const st_plan & p, uint8_t * out) {
+    GGML_UNUSED(L);
+
+    const int64_t n_head   = p.ne[2];
+    const int64_t dst_dim  = p.ne[0];
+    const int64_t dst_rows = p.ne[1];
+    const int64_t nope     = p.kv_nope;
+    const int64_t vdim     = p.kv_v;
+    const int64_t src_cols = p.src.ne[1];
+    const int64_t src_rows = n_head * (nope + vdim);
+
+    std::vector<uint8_t> sbuf((size_t) src_rows * src_cols * st_dtype_size(p.src.dtype));
+    p.src.shard->read(p.src.offs, sbuf.data(), sbuf.size());
+
+    std::vector<float> scale_buf;
+    int64_t scale_stride = 0;
+    if (p.has_scale) {
+        scale_stride = p.scale.ncols();
+        const size_t n = (size_t) p.scale.nrows() * p.scale.ncols();
+        std::vector<uint8_t> raw(n * st_dtype_size(p.scale.dtype));
+        p.scale.shard->read(p.scale.offs, raw.data(), raw.size());
+        scale_buf.resize(n);
+        for (size_t i = 0; i < n; ++i) {
+            scale_buf[i] = st_read_f32(raw.data(), p.scale.dtype, i);
+        }
+    }
+
+    const int64_t row_bytes = ggml_is_quantized(p.type) ? ggml_row_size(p.type, dst_dim) :
+                              (int64_t) dst_dim * ggml_type_size(p.type);
+    const float * etable = st_e4m3_table();
+    std::vector<float> row(dst_dim);
+
+    for (int64_t h = 0; h < n_head; ++h) {
+        for (int64_t i1 = 0; i1 < dst_rows; ++i1) {
+            for (int64_t i0 = 0; i0 < dst_dim; ++i0) {
+                const int64_t srow = p.kv_split == 1 ? h*(nope + vdim) + i0     : h*(nope + vdim) + nope + i1;
+                const int64_t scol = p.kv_split == 1 ? i1                        : i0;
+                float v;
+                if (p.src.dtype == ST_DT_F8) {
+                    const float sc = p.scale_per_tensor ? scale_buf[0] :
+                                     scale_buf[(srow / ST_BLOCK) * scale_stride + scol / ST_BLOCK];
+                    v = etable[sbuf[(size_t) srow*src_cols + scol]] * sc;
+                } else {
+                    v = st_read_f32(sbuf.data(), p.src.dtype, srow*src_cols + scol);
+                }
+                row[i0] = v;
+            }
+
+            uint8_t * drow = out + (size_t) (h*dst_rows + i1) * row_bytes;
+            if (p.type == GGML_TYPE_Q8_0 || p.type == GGML_TYPE_Q4_0) {
+                ggml_quantize_chunk(p.type, row.data(), drow, 0, 1, dst_dim, nullptr);
+            } else if (p.type == GGML_TYPE_F32) {
+                memcpy(drow, row.data(), (size_t) dst_dim * 4);
+            } else if (p.type == GGML_TYPE_BF16) {
+                for (int64_t c = 0; c < dst_dim; ++c) {
+                    ((uint16_t *) drow)[c] = st_f32_to_bf16(row[c]);
+                }
+            } else {
+                ggml_fp32_to_fp16_row(row.data(), (ggml_fp16_t *) drow, dst_dim);
+            }
+        }
     }
 }
 
@@ -1704,6 +1963,11 @@ static void st_emit(const st_loader & L, const st_plan & p, uint8_t * out) {
         for (int64_t i = 0; i < p.ne[0]; ++i) {
             dst[i] = i < p.rope_freqs_rot ? 1.0f : 1e30f;
         }
+        return;
+    }
+
+    if (p.kv_split) {
+        st_emit_kv_proj(L, p, out);
         return;
     }
 
@@ -2466,11 +2730,219 @@ static bool st_map_tensor_nemotron(const std::string & name, int64_t ssm_groups,
 }
 
 // how the tensors of a checkpoint are mapped
+// ---------------------------------------------------------------------------
+// xing4.0: deepseek-v2 style MLA and MoE, mHC residual streams and a deepseek-v3 MTP block
+// ---------------------------------------------------------------------------
+
+// maps the checkpoint of the xing family: mHC tensors, the split kv_b projection and the MTP block
+static bool st_map_tensor_xing4_0(const std::string & name, int64_t n_layer, st_map & res, int64_t & expert, std::string & expert_base) {
+    if (name == "model.embed_tokens.weight") {
+        res.gguf = "token_embd.weight";
+        return true;
+    }
+    if (name == "model.norm.weight") {
+        res.gguf = "output_norm.weight";
+        res.role = ST_ROLE_F32;
+        return true;
+    }
+    if (name == "lm_head.weight") {
+        res.gguf = "output.weight";
+        return true;
+    }
+
+    static const char * prefix = "model.layers.";
+    if (name.rfind(prefix, 0) != 0) {
+        return false;
+    }
+    const size_t pos = strlen(prefix);
+    const size_t dot = name.find('.', pos);
+    if (dot == std::string::npos) {
+        return false;
+    }
+    const int il = atoi(name.substr(pos, dot - pos).c_str());
+    const std::string rest = name.substr(dot + 1);
+    const std::string base = "blk." + std::to_string(il) + ".";
+
+    // the appended MTP block has its own head tensors; the rest of the block maps like a layer
+    if (il >= (int) n_layer) {
+        if (rest == "eh_proj.weight")          { res.gguf = base + "nextn.eh_proj.weight";          return true; }
+        if (rest == "enorm.weight")            { res.gguf = base + "nextn.enorm.weight";            res.role = ST_ROLE_F32; return true; }
+        if (rest == "hnorm.weight")            { res.gguf = base + "nextn.hnorm.weight";            res.role = ST_ROLE_F32; return true; }
+        if (rest == "embed_tokens.weight")     { res.gguf = base + "nextn.embed_tokens.weight";     return true; }
+        if (rest == "shared_head.head.weight") { res.gguf = base + "nextn.shared_head_head.weight"; return true; }
+        if (rest == "shared_head.norm.weight") { res.gguf = base + "nextn.shared_head_norm.weight"; res.role = ST_ROLE_F32; return true; }
+    }
+
+    // routed experts stack into a single 3d tensor
+    if (rest.rfind("mlp.experts.", 0) == 0) {
+        const std::string tail = rest.substr(strlen("mlp.experts."));
+        const size_t p = tail.find('.');
+        if (p == std::string::npos) {
+            return false;
+        }
+        expert = atoll(tail.substr(0, p).c_str());
+        const std::string proj = tail.substr(p + 1);
+        if (proj == "gate_proj.weight")      expert_base = base + "ffn_gate_exps.weight";
+        else if (proj == "up_proj.weight")   expert_base = base + "ffn_up_exps.weight";
+        else if (proj == "down_proj.weight") expert_base = base + "ffn_down_exps.weight";
+        else return false;
+        return true;
+    }
+
+    struct entry {
+        const char * suffix;
+        const char * gguf;
+        enum st_role role;
+        int kv_split;
+    };
+
+    static const entry entries[] = {
+        { "input_layernorm.weight",              "attn_norm.weight",      ST_ROLE_F32,    0 },
+        { "post_attention_layernorm.weight",     "ffn_norm.weight",       ST_ROLE_F32,    0 },
+        { "self_attn.q_a_proj.weight",           "attn_q_a.weight",       ST_ROLE_WEIGHT, 0 },
+        { "self_attn.q_a_layernorm.weight",      "attn_q_a_norm.weight",  ST_ROLE_F32,    0 },
+        { "self_attn.q_b_proj.weight",           "attn_q_b.weight",       ST_ROLE_WEIGHT, 0 },
+        { "self_attn.kv_a_proj_with_mqa.weight", "attn_kv_a_mqa.weight",  ST_ROLE_WEIGHT, 0 },
+        { "self_attn.kv_a_layernorm.weight",     "attn_kv_a_norm.weight", ST_ROLE_F32,    0 },
+        { "self_attn.kv_b_proj.weight",          "attn_k_b.weight",       ST_ROLE_WEIGHT, 1 },
+        { "self_attn.o_proj.weight",             "attn_output.weight",    ST_ROLE_WEIGHT, 0 },
+        { "mlp.gate_proj.weight",                "ffn_gate.weight",       ST_ROLE_WEIGHT, 0 },
+        { "mlp.up_proj.weight",                  "ffn_up.weight",         ST_ROLE_WEIGHT, 0 },
+        { "mlp.down_proj.weight",                "ffn_down.weight",       ST_ROLE_WEIGHT, 0 },
+        { "mlp.gate.weight",                     "ffn_gate_inp.weight",   ST_ROLE_F32,    0 },
+        { "mlp.gate.e_score_correction_bias",    "exp_probs_b.bias",      ST_ROLE_F32,    0 },
+        { "mlp.shared_experts.gate_proj.weight", "ffn_gate_shexp.weight", ST_ROLE_WEIGHT, 0 },
+        { "mlp.shared_experts.up_proj.weight",   "ffn_up_shexp.weight",   ST_ROLE_WEIGHT, 0 },
+        { "mlp.shared_experts.down_proj.weight", "ffn_down_shexp.weight", ST_ROLE_WEIGHT, 0 },
+        { "attn_hc.hc_fn",                       "hc_attn_fn.weight",     ST_ROLE_WEIGHT, 0 },
+        { "attn_hc.hc_base",                     "hc_attn_base.weight",   ST_ROLE_F32,    0 },
+        { "attn_hc.hc_scale",                    "hc_attn_scale.weight",  ST_ROLE_F32,    0 },
+        { "ffn_hc.hc_fn",                        "hc_ffn_fn.weight",      ST_ROLE_WEIGHT, 0 },
+        { "ffn_hc.hc_base",                      "hc_ffn_base.weight",    ST_ROLE_F32,    0 },
+        { "ffn_hc.hc_scale",                     "hc_ffn_scale.weight",   ST_ROLE_F32,    0 },
+    };
+
+    for (const auto & e : entries) {
+        if (rest == e.suffix) {
+            res.gguf     = base + e.gguf;
+            res.role     = e.role;
+            res.kv_split = e.kv_split;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static void st_add_meta_xing4_0(gguf_context * meta, const json & cfg, const std::string & dir_name) {
+    const json & t = cfg.contains("text_config") ? cfg.at("text_config") : cfg;
+
+    auto get_u32 = [&](std::initializer_list<const char *> keys, uint32_t def) {
+        for (const char * key : keys) {
+            if (st_json_set(t, key)) {
+                return t.at(key).get<uint32_t>();
+            }
+        }
+        return def;
+    };
+    auto get_f32 = [&](std::initializer_list<const char *> keys, float def) {
+        for (const char * key : keys) {
+            if (st_json_set(t, key)) {
+                return t.at(key).get<float>();
+            }
+        }
+        return def;
+    };
+    auto get_bool = [&](std::initializer_list<const char *> keys, bool def) {
+        for (const char * key : keys) {
+            if (st_json_set(t, key)) {
+                return t.at(key).get<bool>();
+            }
+        }
+        return def;
+    };
+
+    const uint32_t n_layer = get_u32({ "num_hidden_layers" }, 0);
+    const uint32_t n_nextn = get_u32({ "num_nextn_predict_layers" }, 0);
+    const uint32_t n_embd  = get_u32({ "hidden_size" }, 0);
+    const uint32_t n_head  = get_u32({ "num_attention_heads" }, 0);
+    const uint32_t n_ff    = get_u32({ "intermediate_size" }, 0);
+    const uint32_t q_lora  = get_u32({ "q_lora_rank" }, 0);
+    const uint32_t kv_lora = get_u32({ "kv_lora_rank" }, 0);
+    const uint32_t qk_nope = get_u32({ "qk_nope_head_dim" }, 0);
+    const uint32_t qk_rope = get_u32({ "qk_rope_head_dim" }, 0);
+    const uint32_t v_head  = get_u32({ "v_head_dim" }, 0);
+    const uint32_t n_expert      = get_u32({ "n_routed_experts" }, 0);
+    const uint32_t n_expert_used = get_u32({ "num_experts_per_tok" }, 0);
+    const uint32_t n_shared      = get_u32({ "n_shared_experts" }, 0);
+    const uint32_t n_ff_exp      = get_u32({ "moe_intermediate_size" }, n_ff);
+    const uint32_t n_dense_lead  = get_u32({ "first_k_dense_replace" }, 0);
+
+    const std::string a = "xing4_0";
+    auto add_u32 = [&](const char * suffix, uint32_t value) { gguf_set_val_u32(meta, (a + "." + suffix).c_str(), value); };
+    auto add_f32 = [&](const char * suffix, float    value) { gguf_set_val_f32(meta, (a + "." + suffix).c_str(), value); };
+
+    gguf_set_val_str(meta, "general.architecture", a.c_str());
+    gguf_set_val_str(meta, "general.name",         dir_name.c_str());
+    gguf_set_val_str(meta, "general.type",         "model");
+
+    add_u32("block_count",              n_layer + n_nextn);
+    add_u32("context_length",           get_u32({ "max_position_embeddings" }, 4096));
+    add_u32("embedding_length",         n_embd);
+    add_u32("feed_forward_length",      n_ff);
+    add_u32("vocab_size",               get_u32({ "vocab_size" }, 0));
+
+    add_u32("attention.head_count",     n_head);
+    add_u32("attention.head_count_kv",  1); // MLA absorbs the heads, like deepseek2
+    add_u32("attention.key_length",     kv_lora + qk_rope);
+    add_u32("attention.value_length",   kv_lora);
+    add_u32("attention.q_lora_rank",    q_lora);
+    add_u32("attention.kv_lora_rank",   kv_lora);
+    add_u32("attention.key_length_mla",   qk_nope + qk_rope);
+    add_u32("attention.value_length_mla", v_head);
+    add_f32("attention.layer_norm_rms_epsilon", get_f32({ "rms_norm_eps" }, 1e-6f));
+
+    add_u32("rope.dimension_count", qk_rope);
+    add_f32("rope.freq_base",       get_f32({ "rope_theta" }, 10000.0f));
+
+    add_u32("expert_count",                 n_expert);
+    add_u32("expert_used_count",            n_expert_used);
+    add_u32("expert_shared_count",          n_shared);
+    add_u32("expert_feed_forward_length",   n_ff_exp);
+    add_f32("expert_weights_scale",         get_f32({ "routed_scaling_factor" }, 1.0f));
+    gguf_set_val_bool(meta, (a + ".expert_weights_norm").c_str(), get_bool({ "norm_topk_prob" }, false));
+    // the router scores with sigmoid and a per expert selection bias
+    gguf_set_val_u32(meta, (a + ".expert_gating_func").c_str(), LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID);
+    add_u32("leading_dense_block_count", n_dense_lead);
+    add_u32("nextn_predict_layers",      n_nextn);
+
+    add_u32("hyper_connection.count",                get_u32({ "hc_mult" }, 1));
+    add_u32("hyper_connection.sinkhorn_iterations",  get_u32({ "hc_sinkhorn_iters" }, 20));
+    add_f32("hyper_connection.epsilon",              get_f32({ "hc_eps" }, 1e-6f));
+
+    if (t.contains("rope_scaling") && t.at("rope_scaling").is_object()) {
+        const json & rs = t.at("rope_scaling");
+        const std::string type = st_normalize_name(st_json_value(rs, "type", st_json_value(rs, "rope_type", std::string())));
+        if (type == "linear" || type == "yarn" || type == "longrope") {
+            gguf_set_val_str(meta, (a + ".rope.scaling.type").c_str(), type.c_str());
+            add_f32("rope.scaling.factor", st_json_value(rs, "factor", 1.0f));
+            if (rs.contains("original_max_position_embeddings")) {
+                add_u32("rope.scaling.original_context_length", rs.at("original_max_position_embeddings").get<uint32_t>());
+            }
+            const float mscale_all = st_json_value(rs, "mscale_all_dim", 0.0f);
+            if (mscale_all != 0.0f) {
+                add_f32("rope.scaling.yarn_log_multiplier", 0.1f * mscale_all);
+            }
+        }
+    }
+}
+
 enum st_map_kind {
     ST_MAP_QWEN,    // hand written mapping of the qwen3.5 / qwen3.6 families
     ST_MAP_GEMMA4,  // hand written mapping of the gemma 4 family
     ST_MAP_GENERIC, // plain decoder mapping
     ST_MAP_NEMOTRON, // hand written mapping of the nemotron-h family
+    ST_MAP_XING4_0,  // hand written mapping of the xing4.0 family
 };
 
 // ---------------------------------------------------------------------------
@@ -2773,6 +3245,7 @@ static void st_build_plans(st_loader & L, gguf_context * meta, const fs::path & 
             case ST_MAP_GEMMA4:  mapped = st_map_tensor_gemma4(base_name, n_layer, m, expert, expert_base); break;
             case ST_MAP_GENERIC: mapped = st_map_tensor_generic(base_name, n_layer, *gen, m, expert, expert_base); break;
             case ST_MAP_NEMOTRON: mapped = st_map_tensor_nemotron(base_name, L.ssm_groups, m, expert, expert_base); break;
+            case ST_MAP_XING4_0:  mapped = st_map_tensor_xing4_0(base_name, n_layer, m, expert, expert_base); break;
         }
         if (!mapped) {
             n_skipped++;
@@ -2815,6 +3288,46 @@ static void st_build_plans(st_loader & L, gguf_context * meta, const fs::path & 
                 add_experts(std::string(expert_base.begin(), expert_base.end() - strlen("ffn_up_exps.weight")) + "ffn_gate_exps.weight", 0, half);
             } else {
                 add_experts(expert_base, 0, ref.ne[1]);
+            }
+            continue;
+        }
+
+        if (m.kv_split) {
+            // the combined MLA kv_b projection splits into attn_k_b and attn_v_b
+            const int64_t n_head  = st_json_value(tc, "num_attention_heads", 0u);
+            const int64_t qk_nope = st_json_value(tc, "qk_nope_head_dim", 0);
+            const int64_t v_head  = st_json_value(tc, "v_head_dim", 0);
+            const int64_t kv_lora = st_json_value(tc, "kv_lora_rank", 0);
+            const auto it_scale = tensors.find(name + "_scale_inv");
+            const bool has_scale = it_scale != tensors.end();
+            if (ref.dtype == ST_DT_F8 && !has_scale) {
+                throw std::runtime_error("missing scales for tensor " + name);
+            }
+            if (ref.ndim != 2 || ref.ne[0] != n_head * (qk_nope + v_head) || ref.ne[1] != kv_lora) {
+                throw std::runtime_error("unexpected shape for tensor " + name);
+            }
+            for (int part = 1; part <= 2; ++part) {
+                auto plan = std::make_unique<st_plan>();
+                plan->name  = part == 1 ? m.gguf :
+                    m.gguf.substr(0, m.gguf.size() - strlen("attn_k_b.weight")) + "attn_v_b.weight";
+                plan->src             = ref;
+                plan->scale           = has_scale ? it_scale->second : st_ref{};
+                plan->has_scale       = has_scale ? 1 : 0;
+                plan->scale_per_block = 1;
+                plan->kv_split        = part;
+                plan->kv_nope         = qk_nope;
+                plan->kv_v            = v_head;
+                plan->ndim            = 3;
+                plan->ne[2]           = n_head;
+                if (part == 1) {
+                    plan->ne[0] = qk_nope;
+                    plan->ne[1] = kv_lora;
+                } else {
+                    plan->ne[0] = kv_lora;
+                    plan->ne[1] = v_head;
+                }
+                plan->type = ref.dtype == ST_DT_F8 ? L.fp8_type : st_ggml_type(ref.dtype);
+                add_plan(std::move(plan));
             }
             continue;
         }
@@ -3196,7 +3709,10 @@ struct llama_model * common_safetensors_load_model(const std::string & path, con
             }
         }
         const st_generic_arch * generic = (native_qwen || gemma4 || nemotron) ? nullptr : st_generic_lookup(cfg);
-        if (!native_qwen && !gemma4 && !nemotron && generic == nullptr) {
+        // xing4.0 is a deepseek style MLA + MoE model with mHC residual streams, driven by config keys
+        const bool xing4_0 = !native_qwen && !gemma4 && !nemotron && generic == nullptr &&
+            st_json_set(cfg, "hc_mult") && st_json_set(cfg, "q_lora_rank") && st_json_set(cfg, "n_routed_experts");
+        if (!native_qwen && !gemma4 && !nemotron && !xing4_0 && generic == nullptr) {
             throw std::runtime_error("unsupported safetensors architecture: " + model_type +
                     " (no mapping for it, and no generic decoder mapping either - convert this checkpoint to GGUF first)");
         }
@@ -3222,7 +3738,11 @@ struct llama_model * common_safetensors_load_model(const std::string & path, con
 
         gguf_context * meta = gguf_init_empty();
 
-        if (model_type == "agnes") {
+        if (xing4_0) {
+            st_add_meta_xing4_0(meta, cfg, dir.filename().string());
+            st_add_meta_vocab_spm(meta, dir, cfg);
+            st_build_plans(*L, meta, dir, cfg, mode, ST_MAP_XING4_0, nullptr);
+        } else if (model_type == "agnes") {
             st_add_meta_agnes(meta, cfg, dir.filename().string());
             st_add_meta_vocab(meta, dir, cfg, ST_VOCAB_BPE);
             st_build_plans_agnes(*L, meta, dir, cfg, mode);
