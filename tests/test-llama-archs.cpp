@@ -265,6 +265,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS, uint32_t(20));
         ms.add_kv(LLM_KV_HYPER_CONNECTION_EPSILON,             1e-6f);
     }
+
     ms.add_kv(LLM_KV_ATTENTION_CLAMP_KQV,              1.0f);
     ms.add_kv(LLM_KV_ATTENTION_LAYERNORM_EPS,          1e-5f);
     ms.add_kv(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,      1e-5f);
@@ -647,6 +648,9 @@ static bool arch_supported(const llm_arch arch) {
     if (arch == LLM_ARCH_DEEPSEEK41) {
         // FIXME: the engram tables take their row count from the file, this fixture only has metadata
         return false;
+    }
+    if (arch == LLM_ARCH_DSPARK) {
+        return false; // TODO dspark head and target-tap tensors
     }
     // FIXME: these hit scheduler/view-backed-output issues with WebGPU on CI.
 #ifdef GGML_USE_WEBGPU

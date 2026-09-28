@@ -79,7 +79,7 @@
 #define ggml_gemm_q1_0_4x4_q8_0_generic ggml_gemm_q1_0_4x4_q8_0
 #define ggml_gemm_q1_0_4x8_q8_0_generic ggml_gemm_q1_0_4x8_q8_0
 #define ggml_gemm_pq2_0_4x8_q8_0_generic ggml_gemm_pq2_0_4x8_q8_0
-#elif defined(__aarch64__) || defined(__arm__) || defined(_M_ARM) || defined(_M_ARM64)
+#elif defined(__aarch64__) || defined(__arm__) || defined(_M_ARM) || defined(_M_ARM64) || defined(_M_ARM64EC)
 // PTQ1_0 currently has only the generic vec_dot; alias it here until a SIMD version lands
 #define ggml_vec_dot_ptq1_0_q8_0_generic ggml_vec_dot_ptq1_0_q8_0
 // repack.cpp
