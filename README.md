@@ -1,4 +1,4 @@
-# llama.cpp
+# cafe-llama.cpp
 
 ![ilustration](ilustration.png)
 
