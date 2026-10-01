@@ -72,6 +72,9 @@ struct clip_init_result {
 struct clip_init_result clip_init(const char * fname, struct clip_context_params ctx_params,
         struct gguf_context * metadata = nullptr, const struct llama_model_source * source = nullptr);
 
+// max number of output tokens per image, -1 if not dynamic size
+int clip_get_image_max_tokens(const struct clip_ctx * ctx);
+
 void clip_free(struct clip_ctx * ctx);
 
 // TODO: should be enum, not string

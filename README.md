@@ -179,18 +179,34 @@ Available quantizations:
 - `mtp-Qwen3.8-Flash-Next-Q8_0.gguf` (~3.94 GB)
 - `mtp-Qwen3.8-Flash-Next-BF16.gguf` (~7.40 GB) - Full precision
 
+
+**Recommended command for Qwen 3.8 27B**
+```sh
+llama-server -m Qwen3.8-27B-Q5-v4-XYZ.gguf --spec-type draft-mtp --spec-draft-n-max 4 --spec-draft-p-min 0.75 \
+  -fa on -ctk q8_0 -ctv q8_0 -c 64000 -np 1 -t 8 -ctkd q4_0 -ctvd q4_0 -ngl 99 -ngld 99
+  
+  Agressive
+  
+ llama-server -m Qwen3.8-27B-Q5-v4-XYZ.gguf --spec-type draft-mtp --spec-draft-n-max 6 --spec-draft-p-min 0.75 \
+  -fa on -ctk q8_0 -ctv q8_0 -c 64000 -np 1 -t 8 -ctkd turbo2 -ctvd turbo2 -ngl 99 -ngld 99 -lm mlock
+
+
+```
+
+
+
 **Recommended Server Command for Qwen 3.8 Flash Next:**
 ```sh
 
 llama-server -m Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf \
 -ctk q8_0 -ctv q8_0 -kvu \
- -fa on -ngl 99 -nhmoe 36 -c 64000 --pipeline-parallel -np 1 --no-ngram 
+ -fa on -ngl 99 -hmoe -c 64000 -np 1 --no-ngram 
 
 Disable Ngram if you don't have enough RAM/VRAM
 llama-server -m Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf \
 -ctk q8_0 -ctv q8_0 -kvu \
- -fa on -ngl 99 -nhmoe 36 -c 64000 \
---no-ngram --pipeline-parallel -np 1 --no-ngram 
+ -fa on -ngl 99 -hmoe -c 64000 \
+--no-ngram -np 1 --no-ngram 
 
 
 
@@ -203,29 +219,16 @@ llama-server \
   -m Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf \
   -md mtp.gguf \
   --spec-type draft-mtp \
-  --spec-draft-n-max 2 \
-  --spec-draft-p-min 0.5 \
-  --spec-adaptive \
+  --spec-draft-n-max 4 \
+  --spec-draft-p-min 0.75 \
   -ngl 99 \
-  -nhmoe 36 \
+  -hmoe \
   -fa on \
   -ctk q8_0 -ctv q8_0 -kvu \
   -ctkd q4_0 -ctvd q4_0 -ngld 99 \
-  -c 64000 -b 8192 -ub 2048 -np 1 \
+  -c 64000 -b 2048 -ub 512 -np 1 \
   --no-ngram 
-  
-  
-  //Faster above 30% context load
-  
-  llama-server -m Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf \
-  -md mtp.gguf -ctk q8_0 -ctv q8_0 -kvu -fa on -c 64000 \
-  -np 1 -t 8 -b 8192 -ub 2048 --spec-type draft-mtp,ngram-mod \
-  --spec-draft-n-max 2 --spec-draft-p-min 0.5 --spec-adaptive \
-  --spec-ngram-mod-n-match 24 --spec-ngram-mod-n-min 48 \
-  --spec-ngram-mod-n-max 64 -ctkd q4_0 -ctvd q4_0 \
-  -nhmoe 34 -ngl 99 -ngld 99 --no-ngram 
-  
-  
+ 
   
 ```
 

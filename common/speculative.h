@@ -82,15 +82,11 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
 // process the batch and update the internal state of the speculative context
 bool common_speculative_process(common_speculative * spec, const common_batch & batch);
 
-// legacy llama_batch input, converted with common_batch_from_llama_batch()
-bool common_speculative_process(common_speculative * spec, const llama_batch & batch);
-
 // true if any implementation requires the target's multi-layer tap capture
 // (see llama_set_capture_layers / llama_get_embeddings_capture_ith) -- used by
 // dspark, which conditions on several intermediate target layers concatenated
 // per position rather than a single pre/post-norm embedding.
 bool common_speculative_need_embd_capture(common_speculative * spec);
-
 // generate drafts for the sequences specified with `common_speculative_get_draft_params`
 void common_speculative_draft(common_speculative * spec);
 
