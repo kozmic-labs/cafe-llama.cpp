@@ -73,29 +73,28 @@ Available quantizations:
 ```sh
 llama-server -m Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf \
   -md mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf \
-  --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.5 \
-  -hmoe -ngld 99 \
-  -fa on -ctk q8_0 -ctv q8_0 \
-  -c 64000 -b 4096 -ub 1024 -np 1 -t 8 \
+  --spec-type draft-mtp --spec-draft-n-max 4 --spec-draft-p-min 0.75 \
+  -ngl 99 -hmoe -ngld 99 \
+  -fa on -ctk q8_0 -ctv q8_0 -kvu -ctkd q4_0 -ctvd q4_0 \
+  -c 64000 -b 4096 -ub 1024 -np 1 -t 8 -lm mlock \
   --no-ngram
 ```
 
-- `-hmoe` keeps the experts in pinned RAM and the GPU computes them, with the hottest ones cached in the free VRAM. Leave out `-ngl`: the automatic fit puts every dense layer on the GPU. `--pipeline-parallel` is not needed.
+- `-hmoe` keeps the experts in pinned RAM and the GPU computes them, with the hottest ones cached in the free VRAM. `--pipeline-parallel` is not needed.
 - A larger `-c` leaves less VRAM for the expert cache, so decode gets a bit slower at long contexts.
 - The first request after a fresh install is slower while the cache fills; the expert heat is saved in `~/.cache/llama.cpp/moe-direct`, so later starts are warm.
-- `--spec-draft-n-max 3` is the best window here: each extra token in the verify pass reads more experts.
 - For repetitive text (code edits, quoted documents) add n-gram drafts: `--spec-type draft-mtp,ngram-mod --spec-ngram-mod-n-match 24 --spec-ngram-mod-n-min 48 --spec-ngram-mod-n-max 64`.
 
 **Recommended Server Command for Qwen 3.8 27B** (dense, built-in MTP head, RTX 3090 24 GB, ~65 t/s):
 ```sh
 llama-server -m Qwen3.8-27B-Q5-v4-XYZ.gguf \
   --spec-type draft-mtp --spec-draft-n-max 4 --spec-draft-p-min 0.75 \
-  -fa on -ctk q8_0 -ctv q8_0 -ctkd q4_0 -ctvd q4_0 -ngld 99 \
+  -ngl 99 -ngld 99 -fa on -ctk q8_0 -ctv q8_0 -kvu -ctkd q4_0 -ctvd q4_0 \
   -c 64000 -np 1 -t 8 -lm mlock
 ```
 
 - `--spec-draft-n-max 4` is the sweet spot (5 is equal, 3 and 6 slightly slower). Never use 7 or more: with 8 tokens per verify pass CUDA switches to the matrix-matrix kernels and decode drops by half.
-- Leave out `-ngl` and `-hmoe`: the automatic fit keeps all layers on the GPU when only the context makes the default 1 GiB margin tight (log: `keeping all layers on the device`). Use `-fitt 1024` if other programs need that VRAM.
+- `-hmoe` is not needed on a dense model.
 
 ### Serving Safetensors Checkpoints
 
