@@ -691,6 +691,9 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     if (strcmp(name, "ggml_backend_cpu_set_threadpool") == 0) {
         return (void *)ggml_backend_cpu_set_threadpool;
     }
+    if (strcmp(name, "ggml_get_type_traits_cpu") == 0) {
+        return (void *)ggml_get_type_traits_cpu;
+    }
 
     return NULL;
 

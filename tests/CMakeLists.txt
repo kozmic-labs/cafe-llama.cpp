@@ -368,6 +368,9 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
 
     # Needs non-public ggml{,-backend}-impl.h
     llama_build_and_test(test-alloc.cpp)
+    llama_build(test-moe-cache.cpp)
+    llama_test(test-moe-cache LABEL "main;backend")
+    set_tests_properties(test-moe-cache PROPERTIES TIMEOUT 120)
 endif()
 
 llama_build(test-export-graph-ops.cpp)

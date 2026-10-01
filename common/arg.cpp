@@ -2920,7 +2920,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             for (int i = 0; i < value; ++i) {
                 static std::list<std::string> buft_overrides;
                 buft_overrides.push_back(llm_ffn_exps_block_regex(i));
-                params.tensor_buft_overrides.push_back({buft_overrides.back().c_str(), common_host_buffer_type()});
+                params.tensor_buft_overrides.push_back({buft_overrides.back().c_str(), common_host_moe_buffer_type()});
             }
         }
     ).set_env("LLAMA_ARG_N_HOST_MOE"));
@@ -2932,6 +2932,70 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.pipeline_parallel = value;
         }
     ).set_env("LLAMA_ARG_PIPELINE_PARALLEL"));
+    add_opt(common_arg(
+        {"--moe-cache"}, "MODE",
+        "adaptively cache the hottest CPU-resident MoE experts in spare VRAM "
+        "(default: auto; auto = automatic budget without weight repacking; on = forced cache mode; "
+        "off/0 = disabled; N = VRAM budget in MiB per device)",
+        [](common_params & params, const std::string & value) {
+            if (value == "off" || value == "0") {
+                params.moe_cache_mode       = LLAMA_MOE_CACHE_MODE_OFF;
+                params.moe_cache_budget_mib = 0;
+            } else if (value == "auto") {
+                params.moe_cache_mode       = LLAMA_MOE_CACHE_MODE_AUTO;
+                params.moe_cache_budget_mib = 0;
+            } else if (value == "on") {
+                params.moe_cache_mode       = LLAMA_MOE_CACHE_MODE_ON;
+                params.moe_cache_budget_mib = 0;
+            } else {
+                char * end = nullptr;
+                errno = 0;
+                const long long budget_mb = strtoll(value.c_str(), &end, 10);
+                if (errno != 0 || end == value.c_str() || *end != '\0' ||
+                    budget_mb <= 0 || budget_mb > 1024 * 1024) {
+                    throw std::invalid_argument("expected auto, on, off, 0, or a positive MiB budget");
+                }
+                params.moe_cache_mode       = LLAMA_MOE_CACHE_MODE_ON;
+                params.moe_cache_budget_mib = (size_t)budget_mb;
+            }
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE"));
+    add_opt(common_arg(
+        {"--moe-cache-profile"},
+        {"--no-moe-cache-profile"},
+        "persist a versioned per-model expert heatmap in the llama.cpp cache directory "
+        "and use it for bounded expert prewarming (default: enabled)",
+        [](common_params & params, bool value) {
+            params.moe_cache_profile = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_PROFILE"));
+    add_opt(common_arg(
+        {"--moe-cache-profile-path"}, "FILE",
+        "path to an expert heatmap profile file for bounded expert prewarming",
+        [](common_params & params, const std::string & value) {
+            params.moe_cache_profile = true;
+            params.moe_cache_profile_path = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_PROFILE_PATH"));
+    add_opt(common_arg(
+        {"--moe-cache-expert-parallel"}, "N",
+        "split cached MoE expert rows across devices "
+        "(default: 0 = disabled; auto = provider policy; N = device fanout)",
+        [](common_params & params, const std::string & value) {
+            if (value == "auto") {
+                params.moe_cache_expert_parallel = -1;
+                return;
+            }
+            char * end = nullptr;
+            errno = 0;
+            const long long fanout = strtoll(value.c_str(), &end, 10);
+            if (errno != 0 || end == value.c_str() || *end != '\0' ||
+                fanout < 0 || fanout > 8) {
+                throw std::invalid_argument("expected auto or a device fanout from 0 to 8");
+            }
+            params.moe_cache_expert_parallel = (int)fanout;
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_EXPERT_PARALLEL"));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
     add_opt(common_arg(
         {"-ngl", "--gpu-layers", "--n-gpu-layers"}, "N",
@@ -4323,7 +4387,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             for (int i = 0; i < value; ++i) {
                 static std::list<std::string> buft_overrides_draft;
                 buft_overrides_draft.push_back(llm_ffn_exps_block_regex(i));
-                params.speculative.draft.tensor_buft_overrides.push_back({buft_overrides_draft.back().c_str(), common_host_buffer_type()});
+                params.speculative.draft.tensor_buft_overrides.push_back({buft_overrides_draft.back().c_str(), common_host_moe_buffer_type()});
             }
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_HOST_MOE"));
@@ -4392,6 +4456,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.p_min = std::stof(value);
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_P_MIN"));
+    add_opt(common_arg(
+        {"--spec-adaptive"},
+        {"--no-spec-adaptive"},
+        string_format("adapt the draft length to the measured per-position acceptance (default: %s)",
+                      params.speculative.adaptive ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.speculative.adaptive = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_ADAPTIVE"));
+    add_opt(common_arg(
+        {"--spec-adaptive-decay"}, "P",
+        string_format("EMA weight for the adaptive draft acceptance (default: %.2f)", params.speculative.adaptive_decay),
+        [](common_params & params, const std::string & value) {
+            params.speculative.adaptive_decay = std::stof(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_ADAPTIVE_DECAY"));
     add_opt(common_arg(
         {"--spec-draft-backend-sampling"},
         {"--no-spec-draft-backend-sampling"},

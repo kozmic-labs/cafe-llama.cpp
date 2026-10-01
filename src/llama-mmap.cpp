@@ -3,6 +3,7 @@
 #include "llama-impl.h"
 
 #include "ggml.h"
+#include "ggml-backend.h"
 
 #include <cstring>
 #include <climits>
@@ -718,6 +719,15 @@ struct llama_mlock::impl {
             return true;
         }
 
+        // POSIX mlock failed (e.g. hitting ulimit -l). Fall back to GPU driver host registration.
+        // The GPU kernel driver pins the physical pages directly without POSIX RLIMIT_MEMLOCK restrictions.
+        ggml_backend_reg_t cuda_reg = ggml_backend_reg_by_name("CUDA");
+        if (cuda_reg) {
+            auto * reg_fn = (bool (*)(void *, size_t)) ggml_backend_reg_get_proc_address(cuda_reg, "ggml_backend_register_host_buffer");
+            if (reg_fn && reg_fn(const_cast<void *>(addr), size)) {
+                return true;
+            }
+        }
 #ifdef __APPLE__
 #define MLOCK_SUGGESTION \
         "Try increasing the sysctl values 'vm.user_wire_limit' and 'vm.global_user_wire_limit' and/or " \
@@ -749,6 +759,13 @@ struct llama_mlock::impl {
     }
 
     static void raw_unlock(void * addr, size_t size) {
+        ggml_backend_reg_t cuda_reg = ggml_backend_reg_by_name("CUDA");
+        if (cuda_reg) {
+            auto * unreg_fn = (void (*)(void *)) ggml_backend_reg_get_proc_address(cuda_reg, "ggml_backend_unregister_host_buffer");
+            if (unreg_fn) {
+                unreg_fn(addr);
+            }
+        }
         if (munlock(addr, size)) {
             LLAMA_LOG_WARN("warning: failed to munlock buffer: %s\n", std::strerror(errno));
         }

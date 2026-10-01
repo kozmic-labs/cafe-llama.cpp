@@ -2,6 +2,8 @@
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
+#include "moe-cache-mmv-tuning.h"
+#include <limits>
 
 #include <cstdint>
 #include <type_traits>
@@ -1666,4 +1668,502 @@ void ggml_cuda_op_mul_mat_vec_q(
         1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, stream);
 
     GGML_UNUSED_VARS(src1, dst, src1_ddf_i, src1_ncols, src1_padded_row_size);
+}
+
+#ifdef GGML_CUDA_MOE_CACHE_FLAT_HITS_TEST_INSTRUMENTATION
+static std::atomic<uint64_t> g_moe_cache_flat_hits_factor_1{0};
+static std::atomic<uint64_t> g_moe_cache_flat_hits_factor_2{0};
+
+static inline void ggml_cuda_moe_cache_flat_hits_record(ggml_cuda_moe_cache_flat_hits_path path) {
+    if (path == ggml_cuda_moe_cache_flat_hits_path::factor_2) {
+        g_moe_cache_flat_hits_factor_2.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        g_moe_cache_flat_hits_factor_1.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+#else
+static inline void ggml_cuda_moe_cache_flat_hits_record(ggml_cuda_moe_cache_flat_hits_path) {}
+#endif
+
+template <ggml_type type, int c_rows_per_block, bool has_fusion, bool has_clamp, bool flat_hits = false>
+__launch_bounds__((flat_hits ? 2 : get_mmvq_mmid_max_batch_for_device<type>())*ggml_cuda_get_physical_warp_size(), 1)
+static __global__ void mul_mat_vec_q_moe_cache(
+        const void * vx_ptr, const void * vy_ptr,
+        const int32_t * ids_ptr, const int32_t * act_ids_ptr,
+        const void * gate_ptr, const int32_t * gate_ids_ptr,
+        float * dst_ptr,
+        const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x,
+        const uint32_t stride_row_x, const uint32_t stride_col_y, const uint32_t stride_col_dst,
+        const uint32_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
+        const uint32_t ncols_dst, const uint32_t ids_stride,
+        const float up_min, const float up_max, const float gate_min, const float gate_max) {
+    const void    * GGML_CUDA_RESTRICT vx  = vx_ptr;
+    const void    * GGML_CUDA_RESTRICT vy  = vy_ptr;
+    const int32_t * GGML_CUDA_RESTRICT ids = ids_ptr;
+    const int32_t * GGML_CUDA_RESTRICT act_ids = act_ids_ptr;
+    const void    * GGML_CUDA_RESTRICT gate = gate_ptr;
+    const int32_t * GGML_CUDA_RESTRICT gate_ids = gate_ids_ptr;
+    float         * GGML_CUDA_RESTRICT dst = dst_ptr;
+
+    constexpr int qk  = ggml_cuda_type_traits<type>::qk;
+    constexpr int qi  = ggml_cuda_type_traits<type>::qi;
+    constexpr int vdr = get_vdr_mmvq(type);
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+
+    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+
+    uint32_t token_idx;
+    uint32_t channel_dst;
+    uint32_t route_idx;
+    if constexpr (flat_hits) {
+        token_idx = 0;
+        route_idx = blockIdx.y*blockDim.y + threadIdx.y;
+        channel_dst = route_idx;
+        if (route_idx >= ncols_dst) {
+            return;
+        }
+    } else {
+        token_idx = threadIdx.y;
+        channel_dst = blockIdx.y;
+        route_idx = channel_dst + token_idx*ids_stride;
+        if (token_idx >= ncols_dst) {
+            return;
+        }
+    }
+    const int      row0        = c_rows_per_block*blockIdx.x;
+    const int      blocks_per_row_x = ncols_x / qk;
+    constexpr int  blocks_per_iter  = vdr * warp_size / qi;
+
+    ggml_cuda_pdl_sync();
+    const uint32_t channel_x = ids[route_idx];
+    const uint32_t channel_gate = has_fusion
+        ? gate_ids[route_idx] : 0;
+    const uint32_t channel_y = act_ids
+        ? act_ids[route_idx]
+        : fastmodulo(channel_dst, nchannels_y);
+
+    const block_q8_1 * y = ((const block_q8_1 *) vy) + channel_y*stride_channel_y + token_idx*stride_col_y;
+    const int kbx_offset  = channel_x*stride_channel_x + row0*stride_row_x;
+    const int gate_kbx_offset = channel_gate*stride_channel_x + row0*stride_row_x;
+
+    // partial sum for each thread
+    float tmp[c_rows_per_block] = {0.0f};
+    float tmp_gate[c_rows_per_block] = {0.0f};
+
+    for (int kbx = threadIdx.x / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+        const int kby = kbx * (qk/QK8_1);
+        const int kqs = vdr * (threadIdx.x % (qi/vdr));
+
+#pragma unroll
+        for (int i = 0; i < c_rows_per_block; ++i) {
+            if (uint32_t(row0 + i) < nrows_x) {
+                tmp[i] += vec_dot_q_cuda(vx, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                if constexpr (has_fusion) {
+                    tmp_gate[i] += vec_dot_q_cuda(gate, &y[kby], gate_kbx_offset + i*stride_row_x + kbx, kqs);
+                }
+            }
+        }
+    }
+
+    ggml_cuda_pdl_lc();
+
+    // Warp-level reduction only - no shared memory needed
+#pragma unroll
+    for (int i = 0; i < c_rows_per_block; ++i) {
+        tmp[i] = warp_reduce_sum<warp_size>(tmp[i]);
+        if constexpr (has_fusion) {
+            tmp_gate[i] = warp_reduce_sum<warp_size>(tmp_gate[i]);
+        }
+    }
+
+    // Write results
+    if (threadIdx.x < c_rows_per_block && (c_rows_per_block == 1 || uint32_t(row0 + threadIdx.x) < nrows_x)) {
+        float result = tmp[threadIdx.x];
+        if constexpr (has_fusion) {
+            float gate_value = tmp_gate[threadIdx.x];
+            if constexpr (has_clamp) {
+                result = fmaxf(fminf(result, up_max), up_min);
+                gate_value = fmaxf(fminf(gate_value, gate_max), gate_min);
+            }
+            result *= ggml_cuda_op_silu_single(gate_value);
+        }
+        if constexpr (flat_hits) {
+            dst[route_idx*stride_channel_dst + row0 + threadIdx.x] = result;
+        } else {
+            dst[channel_dst*stride_channel_dst + token_idx*stride_col_dst + row0 + threadIdx.x] = result;
+        }
+    }
+
+    if constexpr (!has_clamp) {
+        GGML_UNUSED_VARS(up_min, up_max, gate_min, gate_max);
+    }
+}
+
+template <ggml_type type, bool has_fusion = false, bool has_clamp = false>
+static void mul_mat_vec_q_moe_cache_launch(
+        const void * vx, const void * vy, const int32_t * ids,
+        const int32_t * act_ids, const void * gate,
+        const int32_t * gate_ids, float * dst,
+        const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x,
+        const uint32_t stride_row_x,
+        const uint32_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
+        const uint32_t n_hits, const int warp_size,
+        const float up_min, const float up_max, const float gate_min,
+        const float gate_max, cudaStream_t stream) {
+
+    constexpr int rows_per_block = 2;
+    const int device = ggml_cuda_get_device();
+    const auto flat_hits = ggml_cuda_select_moe_cache_flat_hits(
+        ggml_cuda_info().devices[device].cc, type, n_hits);
+    if (flat_hits.path == ggml_cuda_moe_cache_flat_hits_path::factor_1) {
+        const int64_t nblocks_rows = (nrows_x + rows_per_block - 1) / rows_per_block;
+        const dim3 block_nums(nblocks_rows, n_hits);
+        const dim3 block_dims(warp_size, 1);
+        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
+        ggml_cuda_kernel_launch(mul_mat_vec_q_moe_cache<type, rows_per_block, has_fusion, has_clamp, false>, launch_params,
+            vx, vy, ids, act_ids, gate, gate_ids, dst, ncols_x, nchannels_y, nrows_x,
+            stride_row_x, 0, 0, stride_channel_x, stride_channel_y, stride_channel_dst,
+            1, n_hits, up_min, up_max, gate_min, gate_max);
+        ggml_cuda_moe_cache_flat_hits_record(flat_hits.path);
+        return;
+    }
+    const int64_t nblocks_rows = (nrows_x + rows_per_block - 1) / rows_per_block;
+    const dim3 block_nums(nblocks_rows, (n_hits + flat_hits.factor - 1) / flat_hits.factor);
+    const dim3 block_dims(warp_size, flat_hits.factor);
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
+
+    ggml_cuda_kernel_launch(mul_mat_vec_q_moe_cache<type, rows_per_block, has_fusion, has_clamp, true>, launch_params,
+        vx, vy, ids, act_ids, gate, gate_ids, dst, ncols_x, nchannels_y, nrows_x,
+        stride_row_x, 0, 0, stride_channel_x, stride_channel_y, stride_channel_dst,
+        n_hits, n_hits, up_min, up_max, gate_min, gate_max);
+    ggml_cuda_moe_cache_flat_hits_record(flat_hits.path);
+}
+
+template <ggml_type type>
+static void ggml_cuda_moe_cache_mmv_t(
+        const void * pool, const char * act_q8,
+        const int32_t * ids_dev, const int32_t * act_ids_dev,
+        float * dst_dev, int64_t n_in, int64_t n_out, int64_t n_slots,
+        int64_t slot_stride_bytes, int64_t n_hits, int64_t act_rows,
+        cudaStream_t stream) {
+    const int64_t ts0 = ggml_type_size(type);
+    const int64_t ne10_padded = GGML_PAD(n_in, MATRIX_ROW_PADDING);
+    const int64_t s01 = ggml_row_size(type, n_in) / ts0;
+    const int64_t s02 = slot_stride_bytes / ts0;
+    const int64_t s11 = ne10_padded / QK8_1;
+
+    const int device = ggml_cuda_get_device();
+    const int warp_size = ggml_cuda_info().devices[device].warp_size;
+    mul_mat_vec_q_moe_cache_launch<type>(
+        pool, act_q8, ids_dev, act_ids_dev, nullptr, nullptr, dst_dev, n_in,
+        init_fastdiv_values(act_rows), n_out,
+        s01, s02, s11, n_out,
+        n_hits, warp_size,
+        0.0f, 0.0f, 0.0f, 0.0f, stream);
+
+    GGML_UNUSED(n_slots);
+}
+
+ggml_cuda_moe_cache_mmv_path ggml_cuda_moe_cache_mmv(
+    const void * pool, ggml_type type0, const char * act_q8,
+    const int32_t * ids_dev, const int32_t * act_ids_dev,
+    float * dst_dev, int64_t n_in, int64_t n_out, int64_t n_slots,
+    int64_t slot_stride_bytes, int64_t n_hits, int64_t act_rows,
+    bool force_dedicated, cudaStream_t stream) {
+
+    const int64_t ts0 = ggml_type_size(type0);
+    GGML_ASSERT(slot_stride_bytes % ts0 == 0);
+
+    if (!act_ids_dev && !force_dedicated) {
+        const int64_t ne10_padded = GGML_PAD(n_in, MATRIX_ROW_PADDING);
+        const int64_t s01 = ggml_row_size(type0, n_in) / ts0;
+        const int64_t s02 = slot_stride_bytes / ts0;
+        const int64_t s11 = ne10_padded / QK8_1;
+        const int64_t s12 = act_rows * s11;
+        ggml_cuda_mm_fusion_args_device fusion_local{};
+        mul_mat_vec_q_switch_type(
+            pool, type0, act_q8, ids_dev, fusion_local, dst_dev, n_in,
+            n_out, 1, s01, s12, n_out,
+            n_slots, act_rows, n_hits, s02, s11, n_out,
+            1, 1, s02*n_slots, s12, n_out*n_hits, n_hits, stream);
+        return ggml_cuda_moe_cache_mmv_path::generic;
+    }
+
+#define MOE_CACHE_MMV_CASE(type_name) \
+        case type_name: \
+            ggml_cuda_moe_cache_mmv_t<type_name>( \
+                pool, act_q8, ids_dev, act_ids_dev, dst_dev, n_in, n_out, \
+                n_slots, slot_stride_bytes, n_hits, act_rows, stream); \
+            break
+    switch (type0) {
+        MOE_CACHE_MMV_CASE(GGML_TYPE_Q1_0);
+        MOE_CACHE_MMV_CASE(GGML_TYPE_Q2_0);
+        MOE_CACHE_MMV_CASE(GGML_TYPE_Q4_0);
+        MOE_CACHE_MMV_CASE(GGML_TYPE_Q4_1);
+        MOE_CACHE_MMV_CASE(GGML_TYPE_Q5_0);
+        MOE_CACHE_MMV_CASE(GGML_TYPE_Q5_1);
+        MOE_CACHE_MMV_CASE(GGML_TYPE_Q8_0);
+        MOE_CACHE_MMV_CASE(GGML_TYPE_MXFP4);
+        MOE_CACHE_MMV_CASE(GGML_TYPE_NVFP4);
+        MOE_CACHE_MMV_CASE(GGML_TYPE_Q2_K);
+        MOE_CACHE_MMV_CASE(GGML_TYPE_Q3_K);
+        MOE_CACHE_MMV_CASE(GGML_TYPE_Q4_K);
+        MOE_CACHE_MMV_CASE(GGML_TYPE_Q5_K);
+        MOE_CACHE_MMV_CASE(GGML_TYPE_Q6_K);
+        MOE_CACHE_MMV_CASE(GGML_TYPE_IQ2_XXS);
+        MOE_CACHE_MMV_CASE(GGML_TYPE_IQ2_XS);
+        MOE_CACHE_MMV_CASE(GGML_TYPE_IQ2_S);
+        MOE_CACHE_MMV_CASE(GGML_TYPE_IQ3_XXS);
+        MOE_CACHE_MMV_CASE(GGML_TYPE_IQ3_S);
+        MOE_CACHE_MMV_CASE(GGML_TYPE_IQ1_S);
+        MOE_CACHE_MMV_CASE(GGML_TYPE_IQ1_M);
+        MOE_CACHE_MMV_CASE(GGML_TYPE_IQ4_NL);
+        MOE_CACHE_MMV_CASE(GGML_TYPE_IQ4_XS);
+        default:
+            GGML_ABORT("unsupported MoE cache type");
+    }
+#undef MOE_CACHE_MMV_CASE
+    return ggml_cuda_moe_cache_mmv_path::dedicated;
+}
+
+template <ggml_type type>
+static void ggml_cuda_moe_cache_mmv_fused_t(
+        const void * up_pool, const void * gate_pool, const char * act_q8,
+        const int32_t * up_ids_dev, const int32_t * gate_ids_dev,
+        const int32_t * act_ids_dev, float * dst_dev,
+        int64_t n_in, int64_t n_out, int64_t slot_stride_bytes,
+        int64_t n_hits, int64_t act_rows, float up_min, float up_max,
+        float gate_min, float gate_max, cudaStream_t stream) {
+    const int64_t ts0 = ggml_type_size(type);
+    const int64_t ne10_padded = GGML_PAD(n_in, MATRIX_ROW_PADDING);
+    const int64_t s01 = ggml_row_size(type, n_in) / ts0;
+    const int64_t s02 = slot_stride_bytes / ts0;
+    const int64_t s11 = ne10_padded / QK8_1;
+
+    const int device = ggml_cuda_get_device();
+    const int warp_size = ggml_cuda_info().devices[device].warp_size;
+    const float inf = std::numeric_limits<float>::infinity();
+    if (up_min == -inf && up_max == inf &&
+        gate_min == -inf && gate_max == inf) {
+        mul_mat_vec_q_moe_cache_launch<type, true, false>(
+            up_pool, act_q8, up_ids_dev, act_ids_dev,
+            gate_pool, gate_ids_dev, dst_dev, n_in,
+            init_fastdiv_values(act_rows), n_out,
+            s01, s02, s11, n_out,
+            n_hits, warp_size,
+            up_min, up_max, gate_min, gate_max, stream);
+    } else {
+        mul_mat_vec_q_moe_cache_launch<type, true, true>(
+            up_pool, act_q8, up_ids_dev, act_ids_dev,
+            gate_pool, gate_ids_dev, dst_dev, n_in,
+            init_fastdiv_values(act_rows), n_out,
+            s01, s02, s11, n_out,
+            n_hits, warp_size,
+            up_min, up_max, gate_min, gate_max, stream);
+    }
+}
+
+void ggml_cuda_moe_cache_mmv_fused(
+        const void * up_pool, const void * gate_pool, ggml_type type0,
+        const char * act_q8, const int32_t * up_ids_dev,
+        const int32_t * gate_ids_dev, const int32_t * act_ids_dev,
+        float * dst_dev, int64_t n_in, int64_t n_out,
+        int64_t slot_stride_bytes, int64_t n_hits, int64_t act_rows,
+        float up_min, float up_max, float gate_min, float gate_max,
+        cudaStream_t stream) {
+    const int64_t ts0 = ggml_type_size(type0);
+    GGML_ASSERT(slot_stride_bytes % ts0 == 0);
+
+#define MOE_CACHE_MMV_FUSED_CASE(type_name) \
+        case type_name: \
+            ggml_cuda_moe_cache_mmv_fused_t<type_name>( \
+                up_pool, gate_pool, act_q8, up_ids_dev, gate_ids_dev, \
+                act_ids_dev, dst_dev, n_in, n_out, slot_stride_bytes, \
+                n_hits, act_rows, up_min, up_max, gate_min, gate_max, \
+                stream); \
+            break
+    switch (type0) {
+        MOE_CACHE_MMV_FUSED_CASE(GGML_TYPE_Q1_0);
+        MOE_CACHE_MMV_FUSED_CASE(GGML_TYPE_Q2_0);
+        MOE_CACHE_MMV_FUSED_CASE(GGML_TYPE_Q4_0);
+        MOE_CACHE_MMV_FUSED_CASE(GGML_TYPE_Q4_1);
+        MOE_CACHE_MMV_FUSED_CASE(GGML_TYPE_Q5_0);
+        MOE_CACHE_MMV_FUSED_CASE(GGML_TYPE_Q5_1);
+        MOE_CACHE_MMV_FUSED_CASE(GGML_TYPE_Q8_0);
+        MOE_CACHE_MMV_FUSED_CASE(GGML_TYPE_MXFP4);
+        MOE_CACHE_MMV_FUSED_CASE(GGML_TYPE_Q2_K);
+        MOE_CACHE_MMV_FUSED_CASE(GGML_TYPE_Q3_K);
+        MOE_CACHE_MMV_FUSED_CASE(GGML_TYPE_Q4_K);
+        MOE_CACHE_MMV_FUSED_CASE(GGML_TYPE_Q5_K);
+        MOE_CACHE_MMV_FUSED_CASE(GGML_TYPE_Q6_K);
+        MOE_CACHE_MMV_FUSED_CASE(GGML_TYPE_IQ2_XXS);
+        MOE_CACHE_MMV_FUSED_CASE(GGML_TYPE_IQ2_XS);
+        MOE_CACHE_MMV_FUSED_CASE(GGML_TYPE_IQ2_S);
+        MOE_CACHE_MMV_FUSED_CASE(GGML_TYPE_IQ3_XXS);
+        MOE_CACHE_MMV_FUSED_CASE(GGML_TYPE_IQ3_S);
+        MOE_CACHE_MMV_FUSED_CASE(GGML_TYPE_IQ1_S);
+        MOE_CACHE_MMV_FUSED_CASE(GGML_TYPE_IQ1_M);
+        MOE_CACHE_MMV_FUSED_CASE(GGML_TYPE_IQ4_NL);
+        MOE_CACHE_MMV_FUSED_CASE(GGML_TYPE_IQ4_XS);
+        default:
+            GGML_ABORT("unsupported fused MoE cache type");
+    }
+#undef MOE_CACHE_MMV_FUSED_CASE
+}
+
+// one block row-slice of one routed row; the expert base comes from a per-expert pointer table,
+// so an expert can live in VRAM or in pinned host memory (read over PCIe)
+template <ggml_type type, int rows_per_warp, bool has_gate>
+static __global__ void mul_mat_vec_q_moe_direct(
+        const uint64_t * __restrict__ table, const uint64_t * __restrict__ gate_table,
+        const void * __restrict__ vy, const int32_t * __restrict__ ids, float * __restrict__ dst,
+        uint32_t * __restrict__ counts, uint32_t * __restrict__ gate_counts, const uint8_t * __restrict__ skip,
+        const uint32_t ncols_x, const uint32_t nrows_x, const uint32_t stride_row_x,
+        const uint32_t n_used, const uint32_t ids_stride, const uint32_t nchannels_y,
+        const uint32_t stride_channel_y, const uint32_t stride_col_y,
+        const uint32_t stride_channel_dst, const uint32_t stride_col_dst) {
+    constexpr int qk  = ggml_cuda_type_traits<type>::qk;
+    constexpr int qi  = ggml_cuda_type_traits<type>::qi;
+    constexpr int vdr = get_vdr_mmvq(type);
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+
+    const uint32_t route = blockIdx.y;
+    const uint32_t tok   = route / n_used;
+    const uint32_t k     = route - tok*n_used;
+    const int32_t  e     = ids[tok*ids_stride + k];
+
+    if (blockIdx.x == 0 && threadIdx.x == 0 && threadIdx.y == 0) {
+        atomicAdd(&counts[e], 1u);
+        if constexpr (has_gate) {
+            atomicAdd(&gate_counts[e], 1u);
+        }
+    }
+
+    const uint32_t row0 = (blockIdx.x*blockDim.y + threadIdx.y)*rows_per_warp;
+    if (row0 >= nrows_x || (skip && skip[route])) {
+        return;
+    }
+
+    const void * x = (const void *) table[e];
+    const void * g = has_gate ? (const void *) gate_table[e] : nullptr;
+    const block_q8_1 * y = ((const block_q8_1 *) vy) + (k % nchannels_y)*stride_channel_y + tok*stride_col_y;
+
+    const int blocks_per_row_x = ncols_x / qk;
+    constexpr int blocks_per_iter = vdr * warp_size / qi;
+
+    float tmp[rows_per_warp]      = {0.0f};
+    float tmp_gate[rows_per_warp] = {0.0f};
+
+    for (int kbx = threadIdx.x / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+        const int kby = kbx * (qk/QK8_1);
+        const int kqs = vdr * (threadIdx.x % (qi/vdr));
+#pragma unroll
+        for (int i = 0; i < rows_per_warp; ++i) {
+            if (row0 + i < nrows_x) {
+                tmp[i] += vec_dot_q_cuda(x, &y[kby], (row0 + i)*stride_row_x + kbx, kqs);
+                if constexpr (has_gate) {
+                    tmp_gate[i] += vec_dot_q_cuda(g, &y[kby], (row0 + i)*stride_row_x + kbx, kqs);
+                }
+            }
+        }
+    }
+
+#pragma unroll
+    for (int i = 0; i < rows_per_warp; ++i) {
+        tmp[i] = warp_reduce_sum<warp_size>(tmp[i]);
+        if constexpr (has_gate) {
+            tmp_gate[i] = warp_reduce_sum<warp_size>(tmp_gate[i]);
+        }
+    }
+
+    if (threadIdx.x < rows_per_warp && row0 + threadIdx.x < nrows_x) {
+        float result = tmp[threadIdx.x];
+        if constexpr (has_gate) {
+            result *= ggml_cuda_op_silu_single(tmp_gate[threadIdx.x]);
+        }
+        dst[k*stride_channel_dst + tok*stride_col_dst + row0 + threadIdx.x] = result;
+    }
+}
+
+template <ggml_type type>
+static void ggml_cuda_moe_direct_mmv_t(const ggml_cuda_moe_direct_mmv_args & a, cudaStream_t stream) {
+    constexpr int rows_per_warp = 2;
+    constexpr int warps = 4;
+    const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+    const dim3 block_nums((a.nrows_x + rows_per_warp*warps - 1) / (rows_per_warp*warps), a.n_routes);
+    const dim3 block_dims(warp_size, warps);
+    if (a.gate_table) {
+        mul_mat_vec_q_moe_direct<type, rows_per_warp, true><<<block_nums, block_dims, 0, stream>>>(
+            a.table, a.gate_table, a.vy, a.ids, a.dst, a.counts, a.gate_counts, a.skip,
+            a.ncols_x, a.nrows_x, a.stride_row_x, a.n_used, a.ids_stride, a.nchannels_y,
+            a.stride_channel_y, a.stride_col_y, a.stride_channel_dst, a.stride_col_dst);
+    } else {
+        mul_mat_vec_q_moe_direct<type, rows_per_warp, false><<<block_nums, block_dims, 0, stream>>>(
+            a.table, nullptr, a.vy, a.ids, a.dst, a.counts, nullptr, a.skip,
+            a.ncols_x, a.nrows_x, a.stride_row_x, a.n_used, a.ids_stride, a.nchannels_y,
+            a.stride_channel_y, a.stride_col_y, a.stride_channel_dst, a.stride_col_dst);
+    }
+}
+
+bool ggml_cuda_moe_direct_mmv_supported(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q1_0:
+        case GGML_TYPE_Q2_0:
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_MXFP4:
+        case GGML_TYPE_Q2_K:
+        case GGML_TYPE_Q3_K:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+        case GGML_TYPE_IQ2_XXS:
+        case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ1_S:
+        case GGML_TYPE_IQ1_M:
+        case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_IQ4_XS:
+            return true;
+        default:
+            return false;
+    }
+}
+
+void ggml_cuda_moe_direct_mmv(ggml_type type, const ggml_cuda_moe_direct_mmv_args & args, cudaStream_t stream) {
+#define MOE_DIRECT_MMV_CASE(type_name) \
+        case type_name: ggml_cuda_moe_direct_mmv_t<type_name>(args, stream); break
+    switch (type) {
+        MOE_DIRECT_MMV_CASE(GGML_TYPE_Q1_0);
+        MOE_DIRECT_MMV_CASE(GGML_TYPE_Q2_0);
+        MOE_DIRECT_MMV_CASE(GGML_TYPE_Q4_0);
+        MOE_DIRECT_MMV_CASE(GGML_TYPE_Q4_1);
+        MOE_DIRECT_MMV_CASE(GGML_TYPE_Q5_0);
+        MOE_DIRECT_MMV_CASE(GGML_TYPE_Q5_1);
+        MOE_DIRECT_MMV_CASE(GGML_TYPE_Q8_0);
+        MOE_DIRECT_MMV_CASE(GGML_TYPE_MXFP4);
+        MOE_DIRECT_MMV_CASE(GGML_TYPE_Q2_K);
+        MOE_DIRECT_MMV_CASE(GGML_TYPE_Q3_K);
+        MOE_DIRECT_MMV_CASE(GGML_TYPE_Q4_K);
+        MOE_DIRECT_MMV_CASE(GGML_TYPE_Q5_K);
+        MOE_DIRECT_MMV_CASE(GGML_TYPE_Q6_K);
+        MOE_DIRECT_MMV_CASE(GGML_TYPE_IQ2_XXS);
+        MOE_DIRECT_MMV_CASE(GGML_TYPE_IQ2_XS);
+        MOE_DIRECT_MMV_CASE(GGML_TYPE_IQ2_S);
+        MOE_DIRECT_MMV_CASE(GGML_TYPE_IQ3_XXS);
+        MOE_DIRECT_MMV_CASE(GGML_TYPE_IQ3_S);
+        MOE_DIRECT_MMV_CASE(GGML_TYPE_IQ1_S);
+        MOE_DIRECT_MMV_CASE(GGML_TYPE_IQ1_M);
+        MOE_DIRECT_MMV_CASE(GGML_TYPE_IQ4_NL);
+        MOE_DIRECT_MMV_CASE(GGML_TYPE_IQ4_XS);
+        default:
+            GGML_ABORT("unsupported MoE direct type");
+    }
+#undef MOE_DIRECT_MMV_CASE
 }

@@ -25,6 +25,7 @@
 #include "sampling.h"
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cmath>
 #include <cinttypes>
@@ -2907,6 +2908,98 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
     }
 };
 
+// true for speculative types that run a draft model (and pay for it); the
+// ngram-based types are free to draft and keep their own length policy
+static bool common_speculative_type_uses_draft_model(common_speculative_type type) {
+    switch (type) {
+        case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:
+        case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:
+        case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:
+        case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
+        case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// Strata-style adaptive draft window. Learns each draft position's conditional
+// acceptance and picks the window that maximizes expected committed tokens per
+// unit of verify cost. A rejected draft costs a full expert pass when the
+// experts are offloaded, so a fixed n_max overshoots on low-acceptance text.
+struct common_speculative_adaptive {
+    static constexpr int KM = 16;
+
+    double decay = 0.1;
+
+    std::array<double, KM> p_acc;   // conditional acceptance at draft position i
+    std::array<double, KM> cost;    // relative cost of verifying a window of i+1 tokens
+
+    common_speculative_adaptive() {
+        p_acc.fill(0.7);
+        // verify cost by window size plus the draft pass itself, relative to one
+        // plain decode step. Kept close to linear: the point is to trim only the
+        // windows whose expected tokens really do not pay, not to second-guess a
+        // healthy acceptance curve (the fork's dense pass dominates the verify).
+        const double verify[KM] = {
+            1.00, 1.08, 1.16, 1.24, 1.40, 1.56, 1.72, 1.88,
+            2.04, 2.20, 2.36, 2.52, 2.68, 2.84, 3.00, 3.16,
+        };
+        for (int i = 0; i < KM; ++i) {
+            cost[i] = verify[i] + 0.1 * (i + 1);
+        }
+    }
+
+    double expected(int k) const {
+        double e = 1.0;
+        double run = 1.0;
+        for (int i = 0; i < k; ++i) {
+            run *= p_acc[i];
+            e += run;
+        }
+        return e;
+    }
+
+    int choose(int cap, double min_gain = 0.0) const {
+        cap = std::min(cap, KM);
+        int best_k = 1;
+        double best = 0.0;
+        for (int k = 1; k <= cap; ++k) {
+            const double rate = expected(k) / cost[k - 1];
+            if (rate > best) {
+                best = rate;
+                best_k = k;
+            }
+        }
+        // plain decoding commits one token at unit cost: 0 disables speculation
+        if (best < 1.0 * (1.0 + min_gain)) {
+            return 0;
+        }
+        return best_k;
+    }
+
+    void observe(int k, int accepted) {
+        if (k <= 0) {
+            return;
+        }
+        k = std::min(k, KM);
+        accepted = std::min(std::max(accepted, 0), k);
+        // positions 0..accepted-1 were accepted, position accepted was rejected
+        const int seen = std::min(k, accepted + 1);
+        for (int i = 0; i < seen; ++i) {
+            const double hit = i < accepted ? 1.0 : 0.0;
+            p_acc[i] += decay * (hit - p_acc[i]);
+        }
+        // a full window is never tested past its end: pull those positions toward
+        // the deepest observed rate so the window can grow again
+        if (accepted == k && k < KM) {
+            for (int i = k; i < KM; ++i) {
+                p_acc[i] += decay * (p_acc[k - 1] - p_acc[i]);
+            }
+        }
+    }
+};
+
 struct common_speculative {
     common_speculative_draft_params_vec dparams;
 
@@ -2920,6 +3013,11 @@ struct common_speculative {
     std::vector<common_speculative_impl *> impl_last;
 
     std::vector<double> synth_probs;
+
+    // adaptive draft length, one learner per sequence
+    bool adaptive_enabled = false;
+    std::vector<common_speculative_adaptive> adaptive;
+    std::vector<int32_t> last_draft_n;
 };
 
 static common_ngram_map get_common_ngram_map(
@@ -3494,7 +3592,17 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         /* .impls       = */ std::move(impls),
         /* .impl_last   = */ std::vector<common_speculative_impl *>(n_seq, nullptr),
         /* .synth_probs = */ {},
+        /* .adaptive_enabled = */ params.adaptive,
+        /* .adaptive = */ std::vector<common_speculative_adaptive>(n_seq),
+        /* .last_draft_n = */ std::vector<int32_t>(n_seq, 0),
     });
+
+    for (auto & learner : result->adaptive) {
+        learner.decay = std::min(1.0, std::max(0.0, params.adaptive_decay));
+    }
+    if (result->adaptive_enabled) {
+        SPC_INF("adaptive draft window: enabled (decay %.2f)\n", params.adaptive_decay);
+    }
 
     const int32_t n_max_configured = common_speculative_n_max(&params);
     const int32_t n_max_effective  = common_speculative_n_max(result.get());
@@ -3588,10 +3696,14 @@ void common_speculative_draft(common_speculative * spec) {
     {
         int n_drafting = 0;
 
-        for (auto & dp : dparams) {
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) dparams.size(); ++seq_id) {
+            auto & dp = dparams[seq_id];
             GGML_ASSERT(!dp.drafting || dp.result->empty());
 
             if (dp.drafting) {
+                if (seq_id < (llama_seq_id) spec->last_draft_n.size()) {
+                    spec->last_draft_n[seq_id] = 0;
+                }
                 n_drafting++;
             }
         }
@@ -3628,6 +3740,18 @@ void common_speculative_draft(common_speculative * spec) {
                         SPC_DBG("truncating draft to %d tokens\n", dp.n_max);
                         result.resize(dp.n_max);
                     }
+                }
+
+                if (spec->adaptive_enabled && common_speculative_type_uses_draft_model(impl->type) && !result.empty()) {
+                    const int n_cap = dp.n_max > 0 ? dp.n_max : common_speculative_n_max(spec);
+                    const int n_adapt = spec->adaptive[seq_id].choose(n_cap);
+                    if ((int) result.size() > n_adapt) {
+                        SPC_DBG("adaptive: truncating draft to %d tokens\n", n_adapt);
+                        result.resize(n_adapt);
+                    }
+                }
+                if (seq_id < (llama_seq_id) spec->last_draft_n.size()) {
+                    spec->last_draft_n[seq_id] = (int32_t) result.size();
                 }
 
                 if (!result.empty()) {
@@ -3669,6 +3793,12 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
     if (impl == nullptr) {
         GGML_ASSERT(n_accepted == 0);
         return;
+    }
+
+    if (spec->adaptive_enabled && common_speculative_type_uses_draft_model(impl->type) &&
+            seq_id >= 0 && seq_id < (llama_seq_id) spec->last_draft_n.size()) {
+        spec->adaptive[seq_id].observe(spec->last_draft_n[seq_id], (int) n_accepted);
+        spec->last_draft_n[seq_id] = 0;
     }
 
     {
@@ -3767,6 +3897,20 @@ void common_speculative_print_stats(const common_speculative * spec) {
                 impl->n_acc_tokens,
                 str_stats.c_str(),
                 str_perf.c_str());
+    }
+
+    if (spec->adaptive_enabled && !spec->adaptive.empty()) {
+        const auto & learner = spec->adaptive[0];
+        std::ostringstream oss;
+        oss << std::fixed << std::setprecision(3);
+        for (int i = 0; i < common_speculative_adaptive::KM; ++i) {
+            if (i > 0) {
+                oss << ", ";
+            }
+            oss << learner.p_acc[i];
+        }
+        SPC_TRC("adaptive draft acceptance per position: (%s), next cap = %d\n",
+                oss.str().c_str(), learner.choose(std::max(1, common_speculative_n_max(spec))));
     }
 }
 

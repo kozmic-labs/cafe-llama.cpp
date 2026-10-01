@@ -376,6 +376,11 @@ struct common_params_speculative {
     double synth_len = -1.0;
     std::vector<double> synth_rates;
 
+    // adapt the draft length to the measured per-position acceptance: a rejected
+    // draft costs a full expert pass when the experts are offloaded
+    bool adaptive = false;
+    double adaptive_decay = 0.1;
+
     // used by Simple, MTP, Eagle3, etc. - all methods that require some kind of draft model
     common_params_speculative_draft draft;
 
@@ -499,9 +504,14 @@ struct common_params {
     int32_t ssd_io_threads = 0; // parallel I/O lanes for streamed expert reads (0 = serial)
     int32_t ssd_cache_mb = 0; // resident expert cache budget in MiB (0 = shared full-tensor slots)
     bool ssd_release_mmap = false; // release the model mapping for streamed expert files after binding
-    bool ssd_predict = true; // predict and hot-load active experts to keep them resident in memory
+    bool ssd_predict = false; // predict and hot-load active experts to keep them resident in memory
     int32_t ssd_cache_slots = 0; // resident expert cache slots per layer (0 = auto or budget-based)
 
+    enum llama_moe_cache_mode moe_cache_mode = LLAMA_MOE_CACHE_MODE_AUTO;
+    size_t moe_cache_budget_mib = 0;
+    int moe_cache_expert_parallel = 0;
+    bool moe_cache_profile = true;
+    std::string moe_cache_profile_path;
     bool pipeline_parallel = false; // FreeToken: enable scheduler pipeline parallelism / host weight prefetch
 
     common_cpu_params cpuparams;
@@ -1259,12 +1269,25 @@ inline ggml_backend_buffer_type_t common_host_buffer_type() {
     return ggml_backend_cpu_buffer_type();
 }
 
+// pinned host memory for MoE experts; a backend that computes the experts straight from host memory exposes its own type
+inline ggml_backend_buffer_type_t common_host_moe_buffer_type() {
+    for (size_t i = 0; i < ggml_backend_reg_count(); ++i) {
+        auto * fn = (ggml_backend_buffer_type_t (*)()) ggml_backend_reg_get_proc_address(ggml_backend_reg_get(i), "ggml_backend_moe_host_buffer_type");
+        if (fn) {
+            if (auto * buft = fn()) {
+                return buft;
+            }
+        }
+    }
+    return common_host_buffer_type();
+}
+
 inline llama_model_tensor_buft_override llm_ffn_exps_cpu_override() {
     return { LLM_FFN_EXPS_REGEX, ggml_backend_cpu_buffer_type() };
 }
 
 inline llama_model_tensor_buft_override llm_ffn_exps_host_override() {
-    return { LLM_FFN_EXPS_REGEX, common_host_buffer_type() };
+    return { LLM_FFN_EXPS_REGEX, common_host_moe_buffer_type() };
 }
 
 inline std::string llm_ffn_exps_block_regex(int idx) {

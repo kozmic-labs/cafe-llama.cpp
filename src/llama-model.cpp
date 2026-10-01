@@ -3267,7 +3267,7 @@ llama_model_params llama_model_default_params() {
         /*.ssd_io_threads             =*/ 0,
         /*.ssd_cache_mb               =*/ 0,
         /*.ssd_release_mmap           =*/ false,
-        /*.ssd_predict                =*/ true,
+        /*.ssd_predict                =*/ false,
         /*.ssd_cache_slots            =*/ 0,
     };
 

@@ -207,6 +207,13 @@ extern "C" {
         LLAMA_SPLIT_MODE_TENSOR = 3,
     };
 
+    enum llama_moe_cache_mode {
+        LLAMA_MOE_CACHE_MODE_UNSPECIFIED = -1,
+        LLAMA_MOE_CACHE_MODE_OFF         = 0,
+        LLAMA_MOE_CACHE_MODE_AUTO        = 1,
+        LLAMA_MOE_CACHE_MODE_ON          = 2,
+    };
+
     enum llama_load_mode {
         LLAMA_LOAD_MODE_AUTO       = -1, // auto-detect based on device capabilities
         LLAMA_LOAD_MODE_NONE       =  0, // no special loading mode
@@ -375,7 +382,7 @@ extern "C" {
         int32_t ssd_io_threads; // parallel I/O lanes for streamed expert reads (0 = serial)
         int32_t ssd_cache_mb; // resident expert cache budget in MiB (0 = shared full-tensor slots)
         bool ssd_release_mmap; // release the model mapping for streamed expert files after binding
-        bool ssd_predict; // predict and hot-load active experts to keep them resident in memory (default: true)
+        bool ssd_predict; // predict and hot-load active experts to keep them resident in memory (default: false)
         int32_t ssd_cache_slots; // resident expert cache slots per layer (0 = auto or budget-based)
     };
 
@@ -446,6 +453,11 @@ extern "C" {
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
 
+
+        enum llama_moe_cache_mode moe_cache_mode;
+        size_t                    moe_cache_budget_mib;
+        int                       moe_cache_expert_parallel;
+        const char *              moe_cache_profile_path;
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
         // note: the samplers must be sampler chains (i.e. use llama_sampler_chain_init)

@@ -70,6 +70,11 @@ struct llama_cparams {
     bool kv_unified;
     bool pipeline_parallel;
 
+    enum llama_moe_cache_mode moe_cache_mode = LLAMA_MOE_CACHE_MODE_AUTO;
+    size_t moe_cache_budget_mib = 0;
+    int moe_cache_expert_parallel = 0;
+    std::string moe_cache_profile_path;
+
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 
     enum llama_context_type ctx_type;

@@ -352,6 +352,31 @@ static void common_params_fit_impl(
         assert(sum_free >= 0 && sum_projected_used >= 0);
         LOG_TRC("%s: projected to use %" PRId64 " MiB of device memory vs. %" PRId64 " MiB of free device memory\n",
             __func__, sum_projected_used/MiB, sum_free/MiB);
+        // when everything fits but the default margin does not, and the context (KV cache) is at least as big as
+        // the shortfall, keep all layers on the device with a smaller margin: moving even one layer to the CPU
+        // costs far more speed (each token, and each speculative draft, then syncs CPU and GPU) than the KV it frees
+        {
+            const int64_t default_margin = int64_t(1024)*MiB;
+            const int64_t min_margin     = int64_t(256)*MiB;
+            bool keep = true;
+            bool short_any = false;
+            for (size_t id = 0; id < nd; id++) {
+                const int64_t pf = projected_free_per_device[id];
+                if (pf >= int64_t(margins[id])) {
+                    continue;
+                }
+                short_any = true;
+                const int64_t shortfall = int64_t(margins[id]) - pf;
+                if (int64_t(margins[id]) != default_margin || pf < min_margin || int64_t(dmds_full[id].mb.context) < shortfall) {
+                    keep = false;
+                }
+            }
+            if (short_any && keep) {
+                LOG_INF("%s: the context leaves less than the default %" PRId64 " MiB free, but at least %" PRId64 " MiB: keeping all layers on the device "
+                    "(use -fitt to require more free memory)\n", __func__, default_margin/MiB, min_margin/MiB);
+                return;
+            }
+        }
         if (nd == 1) {
             if (projected_free_per_device[0] >= margins[0]) {
                 LOG_TRC("%s: will leave %" PRId64 " >= %" PRId64 " MiB of free device memory, no changes needed\n",
@@ -548,6 +573,9 @@ static void common_params_fit_impl(
     const size_t ntbo = llama_max_tensor_buft_overrides();
 
     // utility function to set n_gpu_layers and tensor_split
+    // buffer type for sparse MoE weights that do not fit: plain CPU memory, or pinned host memory that the GPU computes from
+    ggml_backend_buffer_type_t moe_spill_buft = ggml_backend_cpu_buffer_type();
+
     auto set_ngl_tensor_split_tbo = [&](
             const std::vector<ngl_t> & ngl_per_device,
             const std::vector<ggml_backend_buffer_type_t> & overflow_bufts,
@@ -578,6 +606,10 @@ static void common_params_fit_impl(
                 }
                 tensor_buft_overrides[itbo].pattern = get_overflow_pattern(il, il == il0 ? ngl_per_device[id].overflow_type : LAYER_FRACTION_MOE);
                 tensor_buft_overrides[itbo].buft = il == il0 ? overflow_bufts[id] : ggml_backend_cpu_buffer_type();
+                if (tensor_buft_overrides[itbo].buft == ggml_backend_cpu_buffer_type() &&
+                        (il != il0 || ngl_per_device[id].overflow_type == LAYER_FRACTION_MOE)) {
+                    tensor_buft_overrides[itbo].buft = moe_spill_buft;
+                }
                 itbo++;
             }
             il0 += ngl_per_device[id].n_part;
@@ -652,6 +684,30 @@ static void common_params_fit_impl(
     for (size_t id = 0; id < nd; id++) {
         targets.push_back(dmds_full[id].free - margins[id]);
         LOG_TRC("%s: id=%zu, target=%" PRId64 " MiB\n", __func__, id, targets[id]/MiB);
+    }
+
+    // pinned memory cannot be paged out or backed by mmap, so only use it when the spilled weights fit in free RAM with room to spare
+    if (hp_nex > 0) {
+        ggml_backend_buffer_type_t buft = common_host_moe_buffer_type();
+        ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        if (buft != common_host_buffer_type() && cpu_dev) {
+            size_t ram_free = 0;
+            size_t ram_total = 0;
+            ggml_backend_dev_memory(cpu_dev, &ram_free, &ram_total);
+            int64_t sum_targets = 0;
+            for (int64_t t : targets) {
+                sum_targets += t;
+            }
+            const int64_t spill = std::max<int64_t>(0, sum_projected_model - sum_targets);
+            if (int64_t(ram_free) > spill + int64_t(8192)*MiB) {
+                moe_spill_buft = buft;
+                LOG_INF("%s: spilled MoE experts go to %s (~%" PRId64 " MiB, %zu MiB of RAM free)\n", __func__,
+                    ggml_backend_buft_name(buft), spill/MiB, ram_free/MiB);
+            } else {
+                LOG_INF("%s: ~%" PRId64 " MiB of MoE experts spill, not enough free RAM (%zu MiB) to pin them: they stay in mapped CPU memory\n",
+                    __func__, spill/MiB, ram_free/MiB);
+            }
+        }
     }
 
     std::vector<ggml_backend_buffer_type_t> overflow_bufts; // which bufts the first partial layer of a device overflows to:
@@ -731,6 +787,14 @@ static void common_params_fit_impl(
             __func__, dev_names[id].c_str(), ngl_per_device[id].n_layer, mem[id]/MiB, projected_margin/MiB);
     }
     if (hp_nex == 0 || global_surplus_cpu_moe <= 0) {
+        set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams);
+        return;
+    }
+
+    // the GPU computes pinned experts itself and fills free VRAM with the hot ones of every layer,
+    // which beats keeping whole layers of experts in VRAM: leave all experts in host memory
+    if (moe_spill_buft != ggml_backend_cpu_buffer_type()) {
+        LOG_INF("%s: all MoE experts stay in %s, free VRAM becomes the expert cache\n", __func__, ggml_backend_buft_name(moe_spill_buft));
         set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams);
         return;
     }

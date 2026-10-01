@@ -1741,6 +1741,24 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.pipeline_parallel = params.pipeline_parallel;
     cparams.swa_full          = params.swa_full;
     cparams.kv_unified        = params.kv_unified;
+    cparams.moe_cache_mode            = params.moe_cache_mode;
+    cparams.moe_cache_budget_mib      = params.moe_cache_budget_mib;
+    cparams.moe_cache_expert_parallel = params.moe_cache_expert_parallel;
+    if (params.moe_cache_profile && cparams.moe_cache_mode != LLAMA_MOE_CACHE_MODE_OFF) {
+        if (params.moe_cache_profile_path.empty() && !params.model.path.empty()) {
+            uint64_t hash = 14695981039346656037ULL;
+            for (char c : params.model.path) {
+                hash = (hash ^ (uint8_t)c) * 1099511628211ULL;
+            }
+            char hex[32];
+            snprintf(hex, sizeof(hex), "%016llx", (unsigned long long)hash);
+            const_cast<common_params &>(params).moe_cache_profile_path =
+                fs_get_cache_file(string_format("moe-experts-%s.v1", hex));
+        }
+        if (!params.moe_cache_profile_path.empty()) {
+            cparams.moe_cache_profile_path = params.moe_cache_profile_path.c_str();
+        }
+    }
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;

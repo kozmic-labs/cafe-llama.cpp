@@ -789,6 +789,15 @@ void ggml_cuda_op_mul_mat_vec_f(
     GGML_UNUSED_VARS(ctx, src1, dst, src1_ddq_i, src1_ncols, src1_padded_row_size);
 }
 
+// Few output rows leave the tensor core kernels with one or a handful of blocks (a 4-row output runs as a single
+// cuBLAS block), so a small batch over such a matrix is faster as a matrix-vector product.
+static bool ggml_cuda_mmvf_ampere_skinny(const int64_t * src0_ne, int64_t ne11) {
+    if (src0_ne[2]*src0_ne[3] != 1) {
+        return false;
+    }
+    return (src0_ne[1] <= 64 && ne11 <= 8) || (src0_ne[1] <= 512 && ne11 <= 4);
+}
+
 bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0_ne, const size_t * src0_nb, int64_t ne11) {
     if (src0_ne[0] % 2 != 0) {
         return false;
@@ -827,7 +836,7 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
             if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
                 const bool src0_small = (src0_ne[1] <= 512 || src0_ne[2]*src0_ne[3] == 1);
                 if (ampere_mma_available(cc)) {
-                    return src0_small && ne11 == 1;
+                    return (src0_small && ne11 == 1) || ggml_cuda_mmvf_ampere_skinny(src0_ne, ne11);
                 }
                 if (cc >= GGML_CUDA_CC_ADA_LOVELACE) {
                     return src0_small && ne11 <= 4;
@@ -853,7 +862,7 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
             if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
                 const bool src0_small = (src0_ne[1] <= 512 || src0_ne[2]*src0_ne[3] == 1);
                 if (ampere_mma_available(cc)) {
-                    return src0_small && ne11 == 1;
+                    return (src0_small && ne11 == 1) || ggml_cuda_mmvf_ampere_skinny(src0_ne, ne11);
                 }
                 if (cc >= GGML_CUDA_CC_ADA_LOVELACE) {
                     return src0_small && ne11 <= 4;
