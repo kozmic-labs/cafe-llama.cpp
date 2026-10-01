@@ -23,9 +23,9 @@ In Mixture of Experts (MoE) models (such as **Qwen 3.8 Flash Next**, **DeepSeek-
 
 | Flag                  | Long Flag                | Description |
 |-----------------------|--------------------------|---|
-| `--pipeline-parallel` | `--no-pipeline-parallel` | Enable the offloading acceleration pipeline. The scheduler keeps 4 device copies of every streamed weight, so it is skipped (with a warning) when `4 x streamed weight bytes` does not fit in VRAM - that is the case for models with hundreds of experts per layer. |
-| `-hmoe`               | `--host-moe`             | Keep **all MoE expert weights** in pinned host memory (`CUDA_Host_MoE`). On CUDA the GPU computes the experts itself: hot experts from a VRAM cache, the rest read straight from host RAM over PCIe. See "GPU-computed host experts" below. |
-| `-nhmoe N`            | `--n-host-moe N`         | Same as `-hmoe` for the MoE weights of the **first N layers**. |
+| `--pipeline-parallel` | `--no-pipeline-parallel` | Enable the offloading acceleration pipeline, required for `-hmoe`, `-nhmoe`, `-hmoed`. |
+| `-hmoe`               | `--host-moe`             | Keep **all MoE expert weights** in pinned host memory (`CUDA_Host`). Enables zero-copy async DMA over PCIe. |
+| `-nhmoe N`            | `--n-host-moe N`         | Keep MoE weights of the **first N layers** in pinned host memory. |
 | `-cmoe`               | `--cpu-moe`              | Keep **all MoE expert weights** in CPU system RAM. |
 | `-ncmoe N`            | `--n-cpu-moe N`          | Keep MoE weights of the **first N layers** in CPU system RAM. |
 | `-ssd`                | `--ssd-streaming`, `--no-ssd-streaming` | Stream **routed expert weights from SSD on-demand** via `mmap`: only the experts a token actually selects page into RAM, the rest stay on disk. |
@@ -34,104 +34,6 @@ In Mixture of Experts (MoE) models (such as **Qwen 3.8 Flash Next**, **DeepSeek-
 | `-nhmoed N`           | `--n-host-moe-draft N`   | Keep draft model MoE weights of the **first N layers** in pinned host memory (for speculative decoding). |
 | `-cmoed`              | `--cpu-moe-draft`        | Keep draft model MoE weights in CPU system RAM (for speculative decoding). |
 | `-ncmoed N`           | `--n-cpu-moe-draft N`    | Keep draft model MoE weights of the **first N layers** in CPU system RAM (for speculative decoding). |
-| `--moe-cache MODE`   | `--no-moe-cache-profile` | Adaptively cache the hottest CPU-resident MoE experts in spare VRAM (`auto`, `on`, `off`, or `N` MiB). Computes resident expert hits on CUDA concurrently while CPU worker threads compute miss rows. |
-
-### Streamed experts: chunk size, drafts and what is left on the table
-
-When the routed experts are not in VRAM, every token pulls its own experts from host memory, so decode
-speed is set by host bandwidth, not by the GPU. Two flags follow from that. Defaults stay as in upstream
-llama.cpp, so set them yourself when you offload:
-
-- **prompt chunk** `-b 8192 -ub 2048` (upstream default `2048 / 512`): one expert weight read serves the
-  whole ubatch, so a bigger chunk reads the experts proportionally less often. Back off if the prompt
-  buffers do not fit.
-- **draft gating** `--spec-draft-p-min 0.5` (upstream default `0`): a draft token carries its own expert
-  reads, so an unlikely draft costs more than it can win. Verification stays exact, only the wasted work
-  goes away.
-- **adaptive draft length** `--spec-adaptive` (default `off`): learn the real per-position acceptance from
-  the verify results and keep only the drafts whose expected tokens beat their cost, down to skipping
-  speculation entirely when even one draft does not pay. This is a portable version of Strata's draft
-  controller; it needs no model change and applies to `draft-mtp`, `draft-eagle3`, `draft-dflash`,
-  `draft-dspark` and `draft-simple` (the ngram types keep their own length policy). Tune the learning rate
-  with `--spec-adaptive-decay` (EMA weight, default `0.1`). It is most useful on the offload path, where a
-  rejected draft is a full set of expert reads.
-
-Measured on an RTX 3090 (24 GB), Ryzen 7 5800X, 60 GB DDR4, `Qwen3.8-Flash-Next GSQ-RCO IQ3_XXS`,
-`-ngl 99 -nhmoe 34 -t 8 -fa on -ctk q8_0 -ctv q8_0`, same 4342-token prompt, 96 tokens generated, greedy:
-
-| Flags | prompt t/s | decode t/s |
-|---|---:|---:|
-| `-b 1024 -ub 128 --pipeline-parallel -md mtp.gguf --spec-draft-n-max 3` (`--pipeline-parallel` is skipped, see the flag table) | 101 | 22.0 |
-| `-b 2048 -ub 512 -md mtp.gguf --spec-draft-n-max 3 --spec-draft-p-min 0` | 58 | 14.7 |
-| the same with `--spec-draft-p-min 0.5` | 242 | 22.5 |
-| `-b 8192 -ub 2048 -md mtp.gguf --spec-draft-n-max 2 --spec-draft-p-min 0.5` | 421 | 23.2 |
-| `-b 8192 -ub 2048`, no speculation | 477 | 24.6 |
-
-What the numbers say: the chunk size is worth up to 4.7x on prompt processing, and an unfiltered MTP
-window is worth less than nothing on this offload path (58 vs 242 prompt t/s, 14.7 vs 22.5 decode t/s).
-Speculation only pays again once the drafts are filtered, but it stays a small loss at the largest
-chunk (23.2 vs 24.6) - with the experts off, each extra token in the window is another full set of expert
-reads, so a rejected draft is expensive here in a way it is not when the experts are in VRAM.
-
-The expert read is the whole cost of decode, which shows in the thread count: same file, all experts in
-pinned host memory (`-nhmoe 48`), decode t/s by `-t`: 1 -> 4.6, 4 -> 14.0, 8 -> 20.0, 16 -> 9.2. Use
-physical cores, not SMT threads. `-t 16` loses because the kernel is bound by memory bandwidth, not by
-cores, and SMT threads only fight over it.
-
-What is left on the table: offload is **per layer**, so a streamed layer is read from host memory in full
-every token, while routing is skewed enough that a cache holding a slice of *each* layer's experts serves
-most lookups from VRAM for the same bytes. Same machine, same IQ3_XXS file, same request (1026 prompt
-tokens, 96 generated, greedy):
-
-| | prompt t/s | decode t/s (3 identical requests) |
-|---|---:|---:|
-| cafe-llama.cpp, `-b 8192 -ub 2048` and `--spec-draft-p-min 0.5` | 256 | 21.7, 21.9, 22.0 |
-| Strata 0.1.24, same file, expert cache on | 256 | 45.3, 72.0, 96.4 |
-
-Prompt processing is at parity at this size; the chunk size alone is what took cafe from 101 to 421 t/s on
-the 4342-token prompt above (`-b`/`-ub` are the upstream defaults otherwise). The decode gap is the missing
-tier, and it widens across identical requests because Strata keeps admitting the experts this conversation
-routes to while cafe reads the streamed layers in full, every token. Closing it needs expert-granular placement: split each `ffn_*_exps` tensor into a
-resident and a streamed part, remap the router ids to both, add the two results. It also needs the streamed
-part to run while the GPU is busy - today the decode graph splits CUDA/CPU about 70 times per token and
-every split ends in a synchronize, so the two halves wait on each other. Speculation stays close to a wash
-for the same reason: a draft the target rejects is a full set of expert reads that bought nothing.
-
-### GPU-computed host experts (`-hmoe`, CUDA)
-
-With `-hmoe` / `-nhmoe` (and `-hmoed` / `-nhmoed` for the draft), the experts stay in pinned host memory, but the GPU runs the `MUL_MAT_ID` itself. Every expert tensor gets a table of per-expert base pointers in VRAM: a slot of the VRAM expert cache when the expert is resident, else its pinned host copy, which the kernel reads over PCIe. The router ids never leave the GPU, so a decode step is a single graph with no CPU/GPU synchronization, and it is captured as one CUDA graph (2 scheduler splits instead of ~70).
-
-- The cache fills the free VRAM in the background on a low-priority stream, hottest experts first (use counts are read back from the device between steps), and replaces cold experts with hysteresis. It keeps 6% of VRAM free (1-3 GiB).
-- Gate/up/SwiGLU are fused into one kernel. Large batches (prompt processing) gather the routed experts into VRAM and run the stock MMQ kernels.
-- It works for every MoE model whose experts are `*_exps` tensors in a CUDA-supported quant type, not only Qwen4. `-cmoe` / `--moe-cache` keep the old CPU path.
-- The expert heat is saved per expert tensor in `$LLAMA_CACHE/moe-direct` (else `~/.cache/llama.cpp/moe-direct`) every 1024 graphs and at exit. The next start fills the cache with those experts first, at up to 2 GiB per graph while VRAM is free, so the first request is not cold. The key includes the tensor bytes, so different models never share a file. This applies to the target, draft and MTP contexts alike.
-- Half of the experts missing from VRAM are computed by CPU threads at the same time, from the same pinned RAM, so RAM bandwidth adds to the PCIe bandwidth (Strata's `pcie_frac`). The GPU picks those routes itself, writes their activations to mapped host memory and bumps a sequence number; the threads poll it, compute and post the results; a kernel later in the same graph waits for them and scatters them into the output. There is no driver call or stream sync between the halves, so the decode step stays one CUDA graph. Idle threads back off to a 50 us poll after 20 ms without work.
-- Controls (environment): `GGML_CUDA_MOE_DIRECT=0` disables it, `GGML_CUDA_MOE_DIRECT_RESERVE_MB` sets the free VRAM to keep, `GGML_CUDA_MOE_DIRECT_BUDGET_MB` caps the cache, `GGML_CUDA_MOE_DIRECT_STATS=N` logs hit rate every N graphs, `GGML_CUDA_MOE_DIRECT_PROFILE=0` disables the saved heat (`GGML_CUDA_MOE_DIRECT_PROFILE_DIR` moves it), `GGML_CUDA_MOE_DIRECT_DECAY` sets the graphs per halving of the heat (default 128), `GGML_CUDA_MOE_DIRECT_CPU_FRAC` sets the CPU share of the misses (default 0.5, `0` disables the CPU threads), `GGML_CUDA_MOE_DIRECT_CPU_THREADS` their count (default: logical cores / 2 - 2).
-
-Same machine and file, 1226-token prompt, 256 tokens, greedy, `-md mtp.gguf --spec-draft-n-max 3 --spec-draft-p-min 0.5 -ngl 99 -ngld 99 -fa on -ctk q8_0 -ctv q8_0 -c 16384 -b 4096 -ub 1024 -t 8 --no-ngram`:
-
-| | decode t/s (requests 1-6) | draft acceptance |
-|---|---:|---:|
-| `-cmoe --moe-cache on` | 21.4, 30.7, 30.5 | 83% |
-| `-hmoe` (GPU-computed experts), cold start | 30.2, 59.2, 60.6, 62.1 | 83% |
-| `-hmoe`, saved expert heat, misses on the GPU only (`CPU_FRAC=0`) | 36.5, 64.9, 63.2, 65.6, 65.9, 67.3 | 83% |
-| `-hmoe`, saved expert heat, half of the misses on 6 CPU threads (default) | 52.1, 78.3, 78.7, 73.3, 81.1, 81.6 | 83% |
-
-CPU share sweep (threads): 0.35 (4) 67-79, 0.5 (4) 66-80, 0.5 (6) 73-82, 0.7 (6) 74-79 t/s.
-
-One target pass over a 4-token MTP window went from 98 ms to 25 ms (1 token: 34 -> 16 ms). Part of that is a CUDA fix that helps every model on Ampere: BF16/F16 matrices with few output rows (Qwen4 hyper-connection and router weights) now use the matrix-vector kernel for small batches instead of a one-block cuBLAS GEMM.
-
-Where the decode time goes at steady state (~50 ms per verify step of the server): draft 3.3 ms, MTP process 0.4 ms, sampling/accept 1 ms, the rest is the target pass. With every expert in VRAM that pass costs 25 ms; with none it costs 218 ms (experts read at ~18 GB/s over PCIe 4.0). At the measured ~87% hit rate (12.8 GiB cache, 31% of the experts) the misses are the remaining ~20 ms, so more cache or fewer misses is what speeds this up further, not the speculative loop. Grouping the routes of a window by expert (one read per expert) was tried and was slower: the repeated reads hit L2, and more blocks in flight keep PCIe busier.
-
-
-### CUDA MoE Expert Cache (`--moe-cache`)
-
-To close the decode gap and bring Strata-style expert caching to `cafe-llama.cpp`, `--moe-cache` adaptively caches the hottest routed experts in spare VRAM when MoE weights are offloaded to host memory (`-hmoe`, `-nhmoe`, `-cmoe`, `-ncmoe`):
-
-- **Modes**: `--moe-cache auto` (default), `--moe-cache on`, `--moe-cache off` (or `--moe-cache N` for an explicit budget in MiB).
-- **Concurrent Execution**: When `MUL_MAT_ID` executes on the CPU, cached expert hits are dispatched asynchronously to CUDA on a dedicated stream while the CPU threads compute uncached misses in parallel, eliminating per-layer host-device synchronizations.
-- **Universal MoE Support**: Applies to all MoE architectures in `cafe-llama.cpp` (Qwen4 / Qwen3.8-Flash-Next, DeepSeek-V2/V3/V4, Mixtral, OLMoE, Qwen2/3/3.5-MoE, Grok, Xing4, etc.).
-- **Tuning & Prewarming**: `--moe-cache-profile` persists hot-expert heatmaps across sessions; `--moe-cache-expert-parallel` parallelizes across multiple GPUs. See `docs/backend/CUDA-MOE-CACHE.md` for complete technical details.
 
 
 ### Turbo KV Cache (low-bit K/V, GPU-only)
@@ -156,18 +58,6 @@ Qwen 3.8 Flash Next includes an internal Prompt Lookup Expert (PLE) N-gram hash 
 | `--no-ngram`  | `--disable-ngram`, `--no-load-ngram`    | Force completely disable the internal N-gram embedding table and PLE layers, skipping all PLE tensors (0 bytes allocated in RAM/VRAM). |
 | `--ngram`     | `--load-ngram`                          | Normal mode: load internal N-gram table and PLE layers into memory (default). |
 
-Nothing in this family is on unless you ask for it: `-ssd`, `-nssd`, `--ngram-ssd`, `--ssd-direct`,
-`--ssd-warm-dense`, `--ssd-release-mmap` and `--ssd-predict` all default to off. `-lzm` keeps the upstream
-default (`auto`), which is what puts the N-gram table on the SSD and reads its rows per token: pass `-lzm off`
-to keep those tensors resident when the machine has the RAM for it. The loader logs each marked tensor it
-leaves on disk (`lazy read enabled`). `--ssd-predict` is off by default here, so `-ssd` streams
-without predicting or hot-loading.
-
-What the upstream `auto` default costs on this model, measured the same way as the table above (RTX 3090,
-`-ngl 99 -nhmoe 34 -b 4096 -ub 1024`, no speculation, 4342-token prompt): with the N-gram table read from the
-SSD 278 prompt / 17.8 decode t/s, with `--no-ngram` 357 / 23.0. Per-token row reads on the SSD are not free;
-if the machine has the RAM for the table, `-lzm off` buys that back.
-
 ### Qwen 3.8 Flash Next & MTP Speculative Decoding
 
 MTP (Multi-Token Prediction) draft models in GGUF format are available at:
@@ -179,56 +69,46 @@ Available quantizations:
 - `mtp-Qwen3.8-Flash-Next-Q8_0.gguf` (~3.94 GB)
 - `mtp-Qwen3.8-Flash-Next-BF16.gguf` (~7.40 GB) - Full precision
 
-
-**Recommended command for Qwen 3.8 27B**
-```sh
-llama-server -m Qwen3.8-27B-Q5-v4-XYZ.gguf --spec-type draft-mtp --spec-draft-n-max 4 --spec-draft-p-min 0.75 \
-  -fa on -ctk q8_0 -ctv q8_0 -c 64000 -np 1 -t 8 -ctkd q4_0 -ctvd q4_0 -ngl 99 -ngld 99
-  
-  Agressive
-  
- llama-server -m Qwen3.8-27B-Q5-v4-XYZ.gguf --spec-type draft-mtp --spec-draft-n-max 6 --spec-draft-p-min 0.75 \
-  -fa on -ctk q8_0 -ctv q8_0 -c 64000 -np 1 -t 8 -ctkd turbo2 -ctvd turbo2 -ngl 99 -ngld 99 -lm mlock
-
-
-```
-
-
-
 **Recommended Server Command for Qwen 3.8 Flash Next:**
 ```sh
 
 llama-server -m Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf \
 -ctk q8_0 -ctv q8_0 -kvu \
- -fa on -ngl 99 -hmoe -c 64000 -np 1 --no-ngram 
+ -fa on -ngl 99 -nhmoe 36 -c 64000 --pipeline-parallel -np 1 --no-ngram 
 
 Disable Ngram if you don't have enough RAM/VRAM
 llama-server -m Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf \
 -ctk q8_0 -ctv q8_0 -kvu \
- -fa on -ngl 99 -hmoe -c 64000 \
---no-ngram -np 1 --no-ngram 
+ -fa on -ngl 99 -nhmoe 36 -c 64000 \
+--no-ngram --pipeline-parallel -np 1 --no-ngram 
 
 
 
 MTP with offload
-
--b/-ub and --spec-draft-p-min are the two streamed-expert flags from the section above, spelled out here
-because the upstream defaults (2048/512 and 0) leave a lot on the table.
-
 llama-server \
   -m Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf \
   -md mtp.gguf \
   --spec-type draft-mtp \
-  --spec-draft-n-max 4 \
-  --spec-draft-p-min 0.75 \
+  --spec-draft-n-max 2 \
   -ngl 99 \
-  -hmoe \
+  -nhmoe 36 \
   -fa on \
   -ctk q8_0 -ctv q8_0 -kvu \
   -ctkd q4_0 -ctvd q4_0 -ngld 99 \
-  -c 64000 -b 2048 -ub 512 -np 1 \
-  --no-ngram 
+  -c 64000 -b 1024 -ub 128 -np 1 \
+  --pipeline-parallel --no-ngram 
+  
+  
+  //Faster above 30% context load
+  
+  llama-server -m Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf \
+  -md mtp.gguf -ctk q8_0 -ctv q8_0 -kvu -fa on -c 64000 \
+  -np 1 -t 8 -b 1024 -ub 128 --spec-type draft-mtp,ngram-mod \
+  --spec-draft-n-max 2 --spec-ngram-mod-n-match 24 --spec-ngram-mod-n-min 48 \
+  --spec-ngram-mod-n-max 64 -ctkd q4_0 -ctvd q4_0 \
+  --pipeline-parallel -nhmoe 34 -ngl 99 -ngld 99 --no-ngram 
  
+  
   
 ```
 
