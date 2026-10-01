@@ -23,8 +23,8 @@ In Mixture of Experts (MoE) models (such as **Qwen 3.8 Flash Next**, **DeepSeek-
 
 | Flag                  | Long Flag                | Description |
 |-----------------------|--------------------------|---|
-| `--pipeline-parallel` | `--no-pipeline-parallel` | Enable the offloading acceleration pipeline, required for `-hmoe`, `-nhmoe`, `-hmoed`. |
-| `-hmoe`               | `--host-moe`             | Keep **all MoE expert weights** in pinned host memory (`CUDA_Host`). Enables zero-copy async DMA over PCIe. |
+| `--pipeline-parallel` | `--no-pipeline-parallel` | Overlap host->device weight streaming with GPU kernels. Only helps weights the scheduler copies (`-cmoe`, multi-GPU); not needed for `-hmoe`/`-nhmoe`. |
+| `-hmoe`               | `--host-moe`             | Keep **all MoE expert weights** in pinned host memory (`CUDA_Host_MoE`). On CUDA the GPU computes the experts itself: hot experts from a VRAM cache, the rest read from RAM over PCIe, part of the misses on CPU threads. |
 | `-nhmoe N`            | `--n-host-moe N`         | Keep MoE weights of the **first N layers** in pinned host memory. |
 | `-cmoe`               | `--cpu-moe`              | Keep **all MoE expert weights** in CPU system RAM. |
 | `-ncmoe N`            | `--n-cpu-moe N`          | Keep MoE weights of the **first N layers** in CPU system RAM. |
