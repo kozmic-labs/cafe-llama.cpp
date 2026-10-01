@@ -69,48 +69,33 @@ Available quantizations:
 - `mtp-Qwen3.8-Flash-Next-Q8_0.gguf` (~3.94 GB)
 - `mtp-Qwen3.8-Flash-Next-BF16.gguf` (~7.40 GB) - Full precision
 
-**Recommended Server Command for Qwen 3.8 Flash Next:**
+**Recommended Server Command for Qwen 3.8 Flash Next** (RTX 3090 24 GB, 64 GB RAM, ~60-80 t/s):
 ```sh
-
 llama-server -m Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf \
--ctk q8_0 -ctv q8_0 -kvu \
- -fa on -ngl 99 -nhmoe 36 -c 64000 --pipeline-parallel -np 1 --no-ngram 
-
-Disable Ngram if you don't have enough RAM/VRAM
-llama-server -m Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf \
--ctk q8_0 -ctv q8_0 -kvu \
- -fa on -ngl 99 -nhmoe 36 -c 64000 \
---no-ngram --pipeline-parallel -np 1 --no-ngram 
-
-
-
-MTP with offload
-llama-server \
-  -m Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf \
-  -md mtp.gguf \
-  --spec-type draft-mtp \
-  --spec-draft-n-max 2 \
-  -ngl 99 \
-  -nhmoe 36 \
-  -fa on \
-  -ctk q8_0 -ctv q8_0 -kvu \
-  -ctkd q4_0 -ctvd q4_0 -ngld 99 \
-  -c 64000 -b 1024 -ub 128 -np 1 \
-  --pipeline-parallel --no-ngram 
-  
-  
-  //Faster above 30% context load
-  
-  llama-server -m Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf \
-  -md mtp.gguf -ctk q8_0 -ctv q8_0 -kvu -fa on -c 64000 \
-  -np 1 -t 8 -b 1024 -ub 128 --spec-type draft-mtp,ngram-mod \
-  --spec-draft-n-max 2 --spec-ngram-mod-n-match 24 --spec-ngram-mod-n-min 48 \
-  --spec-ngram-mod-n-max 64 -ctkd q4_0 -ctvd q4_0 \
-  --pipeline-parallel -nhmoe 34 -ngl 99 -ngld 99 --no-ngram 
- 
-  
-  
+  -md mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf \
+  --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.5 \
+  -hmoe -ngld 99 \
+  -fa on -ctk q8_0 -ctv q8_0 \
+  -c 64000 -b 4096 -ub 1024 -np 1 -t 8 \
+  --no-ngram
 ```
+
+- `-hmoe` keeps the experts in pinned RAM and the GPU computes them, with the hottest ones cached in the free VRAM. Leave out `-ngl`: the automatic fit puts every dense layer on the GPU. `--pipeline-parallel` is not needed.
+- A larger `-c` leaves less VRAM for the expert cache, so decode gets a bit slower at long contexts.
+- The first request after a fresh install is slower while the cache fills; the expert heat is saved in `~/.cache/llama.cpp/moe-direct`, so later starts are warm.
+- `--spec-draft-n-max 3` is the best window here: each extra token in the verify pass reads more experts.
+- For repetitive text (code edits, quoted documents) add n-gram drafts: `--spec-type draft-mtp,ngram-mod --spec-ngram-mod-n-match 24 --spec-ngram-mod-n-min 48 --spec-ngram-mod-n-max 64`.
+
+**Recommended Server Command for Qwen 3.8 27B** (dense, built-in MTP head, RTX 3090 24 GB, ~65 t/s):
+```sh
+llama-server -m Qwen3.8-27B-Q5-v4-XYZ.gguf \
+  --spec-type draft-mtp --spec-draft-n-max 4 --spec-draft-p-min 0.75 \
+  -fa on -ctk q8_0 -ctv q8_0 -ctkd q4_0 -ctvd q4_0 -ngld 99 \
+  -c 64000 -np 1 -t 8 -lm mlock
+```
+
+- `--spec-draft-n-max 4` is the sweet spot (5 is equal, 3 and 6 slightly slower). Never use 7 or more: with 8 tokens per verify pass CUDA switches to the matrix-matrix kernels and decode drops by half.
+- Leave out `-ngl` and `-hmoe`: the automatic fit keeps all layers on the GPU when only the context makes the default 1 GiB margin tight (log: `keeping all layers on the device`). Use `-fitt 1024` if other programs need that VRAM.
 
 ### Serving Safetensors Checkpoints
 
