@@ -19,6 +19,9 @@ concurrency:
 env:
   BRANCH_NAME: ${{ github.head_ref || github.ref_name }}
   CMAKE_ARGS: "-DLLAMA_BUILD_EXAMPLES=ON -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DGGML_RPC=ON"
+  # CUDA 12 still covers Maxwell/Pascal/Volta; CUDA 13 drops them but adds Blackwell/Thor
+  CUDA12_ARCHS: "50-real;52-real;60-real;61-real;70-real;75-real;80-real;86-real;89-real;90-real;90-virtual"
+  CUDA13_ARCHS: "75-real;80-real;86-real;87-real;89-real;90-real;100-real;103-real;110-real;120-real;121-real;110-virtual"
 
 jobs:
   macOS-cpu:
@@ -33,10 +36,6 @@ jobs:
             arch: 'arm64'
             os: macos-26
             defines: "-DGGML_METAL_USE_BF16=ON -DGGML_METAL_EMBED_LIBRARY=ON -DGGML_CPU_KLEIDIAI=ON -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0"
-          - build: 'x64'
-            arch: 'x64'
-            os: macos-15-intel
-            defines: "-DGGML_METAL=OFF -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3"
 
     runs-on: ${{ matrix.os }}
 
@@ -142,18 +141,32 @@ jobs:
           name: llama-bin-ubuntu-${{ matrix.build }}.tar.gz
 
   linux-cuda:
-    runs-on: ubuntu-22.04
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 360
 
     strategy:
       matrix:
         include:
           - cuda: '12.4'
             cuda_pkg: '12-4'
+            arch: x64
+            os: ubuntu-22.04
+            repo: ubuntu2204/x86_64
           - cuda: '12.8'
             cuda_pkg: '12-8'
+            arch: x64
+            os: ubuntu-22.04
+            repo: ubuntu2204/x86_64
           - cuda: '13.3'
             cuda_pkg: '13-3'
-
+            arch: x64
+            os: ubuntu-22.04
+            repo: ubuntu2204/x86_64
+          - cuda: '13.3'
+            cuda_pkg: '13-3'
+            arch: arm64
+            os: ubuntu-24.04-arm
+            repo: ubuntu2404/sbsa
     steps:
       - name: Clone
         uses: actions/checkout@v6
@@ -163,12 +176,12 @@ jobs:
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.21
         with:
-          key: ubuntu-22-cmake-cuda-${{ matrix.cuda }}
+          key: linux-cuda-${{ matrix.cuda }}-${{ matrix.arch }}
           evict-old-files: 1d
 
       - name: Install CUDA toolkit
         run: |
-          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/${{ matrix.repo }}/cuda-keyring_1.1-1_all.deb
           sudo dpkg -i cuda-keyring_1.1-1_all.deb
           sudo apt-get update
           sudo apt-get -y install cuda-toolkit-${{ matrix.cuda_pkg }}
@@ -183,6 +196,7 @@ jobs:
             -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
             -DGGML_NATIVE=OFF \
             -DGGML_CUDA=ON \
+            -DCMAKE_CUDA_ARCHITECTURES="${{ startsWith(matrix.cuda, '12.') && env.CUDA12_ARCHS || env.CUDA13_ARCHS }}" \
             ${{ env.CMAKE_ARGS }}
           cmake --build build --config Release -j $(nproc) 2>&1 | grep -v "^nvcc warning"
 
@@ -193,13 +207,13 @@ jobs:
       - name: Pack artifacts
         run: |
           cp LICENSE ./build/bin/
-          tar -czvf llama-${{ steps.tag.outputs.name }}-bin-linux-cuda-${{ matrix.cuda }}-x64.tar.gz --transform "s,./,llama-${{ steps.tag.outputs.name }}/," -C ./build/bin .
+          tar -czvf llama-${{ steps.tag.outputs.name }}-bin-linux-cuda-${{ matrix.cuda }}-${{ matrix.arch }}.tar.gz --transform "s,./,llama-${{ steps.tag.outputs.name }}/," -C ./build/bin .
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v6
         with:
-          path: llama-${{ steps.tag.outputs.name }}-bin-linux-cuda-${{ matrix.cuda }}-x64.tar.gz
-          name: llama-bin-linux-cuda-${{ matrix.cuda }}-x64.tar.gz
+          path: llama-${{ steps.tag.outputs.name }}-bin-linux-cuda-${{ matrix.cuda }}-${{ matrix.arch }}.tar.gz
+          name: llama-bin-linux-cuda-${{ matrix.cuda }}-${{ matrix.arch }}.tar.gz
 
   windows-cpu:
     runs-on: windows-2025
@@ -263,6 +277,7 @@ jobs:
 
   windows-cuda:
     runs-on: windows-2022
+    timeout-minutes: 360
 
     strategy:
       matrix:
@@ -311,6 +326,7 @@ jobs:
             ${{ matrix.arch == 'arm64' && '-DGGML_BACKEND_DL=ON -DGGML_CPU=OFF' || '' }} ^
             -DLLAMA_BUILD_BORINGSSL=ON ^
             -DCMAKE_CUDA_FLAGS="-diag-suppress=221" ^
+            -DCMAKE_CUDA_ARCHITECTURES="${{ startsWith(matrix.cuda, '12.') && env.CUDA12_ARCHS || env.CUDA13_ARCHS }}" ^
             ${{ matrix.defines }} ${{ env.CMAKE_ARGS }}
           set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
           cmake --build build --config Release -j %NINJA_JOBS% ${{ matrix.arch == 'arm64' && '--target ggml-cuda' || '' }}
@@ -515,9 +531,9 @@ jobs:
             "llama-${{ steps.tag.outputs.name }}-bin-linux-cuda-12.4-x64.tar.gz"
             "llama-${{ steps.tag.outputs.name }}-bin-linux-cuda-12.8-x64.tar.gz"
             "llama-${{ steps.tag.outputs.name }}-bin-linux-cuda-13.3-x64.tar.gz"
+            "llama-${{ steps.tag.outputs.name }}-bin-linux-cuda-13.3-arm64.tar.gz"
             "llama-${{ steps.tag.outputs.name }}-bin-macos-arm64-kleidiai.tar.gz"
             "llama-${{ steps.tag.outputs.name }}-bin-macos-arm64.tar.gz"
-            "llama-${{ steps.tag.outputs.name }}-bin-macos-x64.tar.gz"
             "llama-${{ steps.tag.outputs.name }}-bin-ubuntu-arm64.tar.gz"
             "llama-${{ steps.tag.outputs.name }}-bin-ubuntu-vulkan-arm64.tar.gz"
             "llama-${{ steps.tag.outputs.name }}-bin-ubuntu-vulkan-x64.tar.gz"
@@ -542,12 +558,11 @@ jobs:
           RELEASE_TAG: ${{ steps.tag.outputs.name }}
         run: |
           cat > release-notes.md <<'EOF'
-          Pre-built binaries (PrismML fork with Q1_0 1-bit quantization support).
+          Pre-built binaries (cafe-llama.cpp). CUDA 12.4 builds cover Maxwell to Hopper (sm50-sm90); CUDA 13 builds cover Turing to Blackwell (sm75-sm121), incl. Jetson Orin/Thor on arm64.
 
           **macOS:**
           - [macOS Apple Silicon (arm64)](https://github.com/${{ github.repository }}/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-macos-arm64.tar.gz)
           - [macOS Apple Silicon (arm64, KleidiAI enabled)](https://github.com/${{ github.repository }}/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-macos-arm64-kleidiai.tar.gz)
-          - [macOS Intel (x64)](https://github.com/${{ github.repository }}/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-macos-x64.tar.gz)
 
           **Linux (CPU):**
           - [Ubuntu x64 (CPU)](https://github.com/${{ github.repository }}/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-ubuntu-x64.tar.gz)
@@ -557,6 +572,7 @@ jobs:
           - [Linux x64 (CUDA 12.4)](https://github.com/${{ github.repository }}/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-linux-cuda-12.4-x64.tar.gz)
           - [Linux x64 (CUDA 12.8)](https://github.com/${{ github.repository }}/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-linux-cuda-12.8-x64.tar.gz)
           - [Linux x64 (CUDA 13.3)](https://github.com/${{ github.repository }}/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-linux-cuda-13.3-x64.tar.gz)
+          - [Linux arm64 (CUDA 13.3)](https://github.com/${{ github.repository }}/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-linux-cuda-13.3-arm64.tar.gz)
 
           **Linux (Vulkan):**
           - [Ubuntu x64 (Vulkan)](https://github.com/${{ github.repository }}/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-ubuntu-vulkan-x64.tar.gz)
