@@ -768,7 +768,7 @@ static bool arch_supported(const llm_arch arch) {
     if (arch == LLM_ARCH_PLM) {
         return false; // TODO tensor shapes
     }
-    if (arch == LLM_ARCH_CLEF) {
+    if (arch == LLM_ARCH_CLEF || arch == LLM_ARCH_VLLM_DECISION2) {
         return false; // TODO decision head tensors
     }
     if (arch == LLM_ARCH_DEEPSEEK2OCR) {
@@ -937,6 +937,11 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
             if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
                 dev_configs.emplace_back(std::vector<ggml_backend_dev_t>{devices_meta[0]}, "MoE cache", LLAMA_SPLIT_MODE_LAYER, true, 1536*1024);
                 max_device_label_length = std::max(max_device_label_length, dev_configs.back().label.length());
+                // each GPU caches the layers assigned to it
+                if (devices_meta.size() > 1) {
+                    dev_configs.emplace_back(devices_meta, "MoE cache, layer split", LLAMA_SPLIT_MODE_LAYER, true, 1536*1024);
+                    max_device_label_length = std::max(max_device_label_length, dev_configs.back().label.length());
+                }
             }
         }
     }

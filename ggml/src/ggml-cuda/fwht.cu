@@ -277,7 +277,10 @@ static bool fwht_launch(ggml_backend_cuda_context & ctx, const T * src_d, float 
             FWHT_CASE(1024)
             FWHT_CASE(2048)
             FWHT_SMEM_CASE(4096)
+#if !defined(GGML_USE_MUSA)
+            // 32 KB of shared memory, above the MUSA limit; falls back there
             FWHT_SMEM_CASE(8192)
+#endif // !defined(GGML_USE_MUSA)
             default:
                 return false;
         }
@@ -287,7 +290,9 @@ static bool fwht_launch(ggml_backend_cuda_context & ctx, const T * src_d, float 
         FWHT_BLOCK_CASE(1024)
         FWHT_BLOCK_CASE(2048)
         FWHT_BLOCK_CASE(4096)
+#if !defined(GGML_USE_MUSA)
         FWHT_BLOCK_CASE(8192)
+#endif // !defined(GGML_USE_MUSA)
 #undef FWHT_CASE
 #undef FWHT_SMEM_CASE
 #undef FWHT_BLOCK_CASE

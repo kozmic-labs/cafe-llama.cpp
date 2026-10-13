@@ -574,9 +574,7 @@ class _LinearAttentionVReorderBase(Qwen3NextModel):
             weight, scale = reorder_rows(weight, scale, 1)
         elif name.endswith(".linear_attn.out_proj.weight"):
             if self._hadamard_folds_tensor(name):
-                # folded latent: a column permutation on the rotation axis cannot be
-                # refolded, so keep the training (grouped) order and let the runtime
-                # permute the activation instead
+                # folded weight: keep the grouped V order, the runtime permutes the activation instead
                 self._hadamard_gdn_v_grouped = True
             else:
                 col_perm = self._reorder_v_heads(
@@ -592,7 +590,7 @@ class _LinearAttentionVReorderBase(Qwen3NextModel):
         super()._repack_nvfp4(name, weight, scale, scale2, input_scale)
 
     def _hadamard_folds_tensor(self, name: str) -> bool:
-        # a manifest entry and `name` may differ only by leading wrapper prefixes
+        # a manifest name and `name` can differ only by leading wrapper prefixes
         return any(name.endswith(n) or n.endswith(name) for n in self.hadamard_folded_names())
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
@@ -641,14 +639,8 @@ class _LinearAttentionVReorderBase(Qwen3NextModel):
                 data_torch = torch.cat([qk_part, v_part], dim=0)
 
             elif ".out_proj." in name:
-                # wrapper prefixes may already be stripped by the time the name reaches
-                # modify_tensors, so match on the full name modulo those prefixes. Matching
-                # on the tensor-kind suffix alone would treat every layer as folded as soon
-                # as one layer is.
                 if self._hadamard_folds_tensor(name):
-                    # Hadamard-folded latent: the rotation axis must keep the
-                    # training (grouped) V order; the runtime permutes the
-                    # activation tiled->grouped before the transform instead.
+                    # folded weight: keep the grouped V order, the runtime permutes the activation instead
                     self._hadamard_gdn_v_grouped = True
                 else:
                     # Out projection weight: reorder columns (input dimension)
@@ -673,10 +665,23 @@ class _Qwen35MRopeMixin:
             self.gguf_writer.add_rope_dimension_sections(self._QWEN35_DEFAULT_MROPE_SECTION)
 
 
-@ModelBase.register("Qwen3_5ForConditionalGeneration", "Qwen3_5ForCausalLM")
+@ModelBase.register("Qwen3_5ForConditionalGeneration", "Qwen3_5ForCausalLM", "Qwen3_5TextModel")
 @ModelBase.example("Qwen/Qwen3.5-9B")
 class Qwen3_5TextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
     model_arch = gguf.MODEL_ARCH.QWEN35
+
+    def __init__(self, dir_model, *args, **kwargs):
+        # Inner TextModel does not own mtp.*. Set no_mtp before mixin bumps block_count.
+        hparams = kwargs.pop("hparams", None)
+        if hparams is None:
+            hparams = ModelBase.load_hparams(dir_model, self.is_mistral_format)
+        if get_model_architecture(hparams, ModelType.TEXT) == "Qwen3_5TextModel":
+            self.no_mtp = True
+        super().__init__(dir_model, *args, hparams=hparams, **kwargs)
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        self._try_set_pooling_type()
 
 
 def _is_openjev_checkpoint(dir_model: Path) -> bool:
