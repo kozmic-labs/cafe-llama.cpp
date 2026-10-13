@@ -15,6 +15,10 @@
 #include <regex>
 #include <unordered_set>
 
+#if defined(__linux__)
+#include <fcntl.h>
+#endif
+
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
 static const size_t GiB = 1024*MiB;
@@ -1604,8 +1608,24 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
 
             const size_t prefetch_size = prefetch && use_mmap ? -1 : 0;
 
+            // tensors of a host buffer that cannot wrap the mapping (e.g. pinned memory) are read with plain file reads in load_all_data
+            // a prefetch through the mapping would read them twice once the copy evicts the page cache
+            // they also get the random access advice of the lazy ranges, the mapping does not read them
+            llama_mmap::ranges no_prefetch = lazy.for_file(idx);
+            for (const auto & [key, ctx] : ctx_map) {
+                if (key.lazy || !ggml_backend_buft_is_host(key.buft) || key.buft == ggml_backend_cpu_buffer_type()) {
+                    continue;
+                }
+                for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t; t = ggml_get_next_tensor(ctx.get(), t)) {
+                    const auto * w = get_weight(ggml_get_name(t));
+                    if (w && w->idx == idx && !w->is_provided) {
+                        no_prefetch.emplace_back(w->offs, w->offs + ggml_nbytes(t));
+                    }
+                }
+            }
+
             std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch_size, is_numa,
-                    lazy.for_file(idx), lazy.expert_for_file(idx), ssd_expert_advice);
+                    no_prefetch, lazy.expert_for_file(idx), ssd_expert_advice);
             mmaps_used.emplace_back(mapping->size(), 0);
             if (mlock_mmaps) {
                 std::unique_ptr<llama_mlock> mlock_mmap(new llama_mlock());
@@ -1958,7 +1978,9 @@ bool llama_model_loader::load_all_data(
             continue;
         }
 
-        const bool from_mapping = use_mmap || lazy.has(cur);
+        // a host buffer that does not wrap the mapping (e.g. pinned memory) is filled with plain file reads, see init_mappings
+        const bool read_to_host = use_mmap && !lazy.has(cur) && cur->buffer && ggml_backend_buffer_is_host(cur->buffer);
+        const bool from_mapping = (use_mmap || lazy.has(cur)) && !read_to_host;
 
         if (from_mapping) {
             const auto & mapping = mappings.at(weight->idx);
@@ -2007,6 +2029,12 @@ bool llama_model_loader::load_all_data(
                         return std::make_pair(cur, ggml_validate_row_data(cur->type, cur->data, n_size));
                     }));
                 }
+#if defined(__linux__)
+                // the host buffer keeps the only copy needed, so give the page cache to the mapped and lazy tensors
+                if (read_to_host) {
+                    posix_fadvise(file->file_id(), weight->offs, n_size, POSIX_FADV_DONTNEED);
+                }
+#endif
             } else {
                 // If upload_backend is valid load the tensor in chunks to pinned memory and upload the buffers asynchronously to the GPU.
                 if (upload_backend) {
