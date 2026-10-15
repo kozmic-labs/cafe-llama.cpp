@@ -738,6 +738,7 @@ enum st_vocab_kind {
     ST_VOCAB_BPE,
     ST_VOCAB_GEMMA4,
     ST_VOCAB_NEMOTRON, // same byte pair encoding, with the pre-tokenizer of the nemotron tokenizer
+    ST_VOCAB_LFM2,
 };
 
 static void st_add_meta_vocab(gguf_context * meta, const fs::path & dir, const json & cfg, enum st_vocab_kind kind) {
@@ -862,7 +863,7 @@ static void st_add_meta_vocab(gguf_context * meta, const fs::path & dir, const j
     const LLM_KV kv(LLM_ARCH_QWEN35MOE);
 
     const char * tokenizer_model = gemma4 ? "gemma4" : "gpt2";
-    const char * tokenizer_pre   = gemma4 ? "gemma4" : kind == ST_VOCAB_NEMOTRON ? "pixtral" : "qwen35";
+    const char * tokenizer_pre   = gemma4 ? "gemma4" : kind == ST_VOCAB_NEMOTRON ? "pixtral" : kind == ST_VOCAB_LFM2 ? "lfm2" : "qwen35";
     ms.add_kv(LLM_KV_TOKENIZER_MODEL,  tokenizer_model);
     ms.add_kv(LLM_KV_TOKENIZER_PRE,    tokenizer_pre);
     ms.add_kv(LLM_KV_TOKENIZER_LIST,   tokens);
@@ -923,7 +924,8 @@ static void st_add_meta_vocab(gguf_context * meta, const fs::path & dir, const j
     ms.add_kv(LLM_KV_TOKENIZER_BOS_ID, bos);
     ms.add_kv(LLM_KV_TOKENIZER_EOS_ID, eos);
     ms.add_kv(LLM_KV_TOKENIZER_PAD_ID, pad);
-    ms.add_kv(LLM_KV_TOKENIZER_ADD_BOS, gemma4 ? true : st_json_value(tokc_cfg, "add_bos_token", false));
+    // the lfm2 pre-tokenizer adds bos by default, the converter does not override it
+    ms.add_kv(LLM_KV_TOKENIZER_ADD_BOS, (gemma4 || kind == ST_VOCAB_LFM2) ? true : st_json_value(tokc_cfg, "add_bos_token", false));
 
     const fs::path tmpl = dir / "chat_template.jinja";
     if (fs::is_regular_file(tmpl)) {
@@ -2943,6 +2945,7 @@ enum st_map_kind {
     ST_MAP_GENERIC, // plain decoder mapping
     ST_MAP_NEMOTRON, // hand written mapping of the nemotron-h family
     ST_MAP_XING4_0,  // hand written mapping of the xing4.0 family
+    ST_MAP_LFM2,     // hand written mapping of the lfm2 / lfm2_moe families
 };
 
 // ---------------------------------------------------------------------------
@@ -3113,6 +3116,156 @@ static void st_add_meta_gemma4(gguf_context * meta, const json & cfg, const std:
     add_u32("rope.dimension_count_swa", (uint32_t) (head_dim * st_json_value(rope_swa, "partial_rotary_factor", 1.0f)));
 }
 
+// ---------------------------------------------------------------------------
+// lfm2 / lfm2_moe: short convolution and attention layers mixed by layer_types,
+// a dense FFN on the leading layers and sigmoid gated experts on the rest
+// ---------------------------------------------------------------------------
+
+static bool st_map_tensor_lfm2(const std::string & name, st_map & res, int64_t & expert, std::string & expert_base) {
+    if (name == "model.embed_tokens.weight") {
+        res.gguf = "token_embd.weight";
+        return true;
+    }
+    // the final norm of lfm2 is named embedding_norm in the checkpoint
+    if (name == "model.embedding_norm.weight") {
+        res.gguf = "token_embd_norm.weight";
+        res.role = ST_ROLE_F32;
+        return true;
+    }
+    if (name == "lm_head.weight") {
+        res.gguf = "output.weight";
+        return true;
+    }
+
+    static const char * prefix = "model.layers.";
+    if (name.rfind(prefix, 0) != 0) {
+        return false;
+    }
+    const size_t pos = strlen(prefix);
+    const size_t dot = name.find('.', pos);
+    if (dot == std::string::npos) {
+        return false;
+    }
+    const int il = atoi(name.substr(pos, dot - pos).c_str());
+    const std::string rest = name.substr(dot + 1);
+    const std::string base = "blk." + std::to_string(il) + ".";
+
+    static const char * prefix_exps = "feed_forward.experts.";
+    if (rest.rfind(prefix_exps, 0) == 0) {
+        const std::string tail = rest.substr(strlen(prefix_exps));
+        const size_t p = tail.find('.');
+        if (p == std::string::npos) {
+            return false;
+        }
+        expert = atoll(tail.substr(0, p).c_str());
+        const std::string proj = tail.substr(p + 1);
+        if (proj == "w1.weight") {
+            expert_base = base + "ffn_gate_exps.weight";
+        } else if (proj == "w3.weight") {
+            expert_base = base + "ffn_up_exps.weight";
+        } else if (proj == "w2.weight") {
+            expert_base = base + "ffn_down_exps.weight";
+        } else {
+            return false;
+        }
+        return true;
+    }
+
+    struct entry {
+        const char * suffix;
+        const char * gguf;
+        enum st_role role;
+    };
+
+    static const entry entries[] = {
+        { "operator_norm.weight",          "attn_norm.weight",          ST_ROLE_F32 },
+        { "ffn_norm.weight",               "ffn_norm.weight",           ST_ROLE_F32 },
+        { "conv.conv.weight",              "shortconv.conv.weight",     ST_ROLE_F32 },
+        { "conv.in_proj.weight",           "shortconv.in_proj.weight",  ST_ROLE_WEIGHT },
+        { "conv.out_proj.weight",          "shortconv.out_proj.weight", ST_ROLE_WEIGHT },
+        { "self_attn.q_proj.weight",       "attn_q.weight",             ST_ROLE_WEIGHT },
+        { "self_attn.k_proj.weight",       "attn_k.weight",             ST_ROLE_WEIGHT },
+        { "self_attn.v_proj.weight",       "attn_v.weight",             ST_ROLE_WEIGHT },
+        { "self_attn.out_proj.weight",     "attn_output.weight",        ST_ROLE_WEIGHT },
+        { "self_attn.q_layernorm.weight",  "attn_q_norm.weight",        ST_ROLE_F32 },
+        { "self_attn.k_layernorm.weight",  "attn_k_norm.weight",        ST_ROLE_F32 },
+        { "feed_forward.w1.weight",        "ffn_gate.weight",           ST_ROLE_WEIGHT },
+        { "feed_forward.w3.weight",        "ffn_up.weight",             ST_ROLE_WEIGHT },
+        { "feed_forward.w2.weight",        "ffn_down.weight",           ST_ROLE_WEIGHT },
+        { "feed_forward.gate.weight",      "ffn_gate_inp.weight",       ST_ROLE_F32 },
+        { "feed_forward.expert_bias",      "exp_probs_b.bias",          ST_ROLE_F32 },
+    };
+
+    for (const auto & e : entries) {
+        if (rest == e.suffix) {
+            res.gguf = base + e.gguf;
+            res.role = e.role;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static void st_add_meta_lfm2(gguf_context * meta, const json & cfg, const std::string & dir_name, bool moe) {
+    const std::string a = moe ? "lfm2moe" : "lfm2";
+    auto add_u32 = [&](const char * suffix, uint32_t value) { gguf_set_val_u32(meta, (a + "." + suffix).c_str(), value); };
+    auto add_f32 = [&](const char * suffix, float    value) { gguf_set_val_f32(meta, (a + "." + suffix).c_str(), value); };
+
+    const uint32_t n_layer   = st_json_value(cfg, "num_hidden_layers", 0u);
+    const uint32_t n_head    = st_json_value(cfg, "num_attention_heads", 0u);
+    const uint32_t n_head_kv = st_json_value(cfg, "num_key_value_heads", n_head);
+    if (n_layer == 0 || n_head == 0) {
+        throw std::runtime_error("cannot read the text configuration of this checkpoint");
+    }
+
+    // conv layers have no kv heads, this is how the model tells them apart
+    std::vector<int32_t> n_kv;
+    n_kv.reserve(n_layer);
+    for (const auto & type : cfg.at("layer_types")) {
+        n_kv.push_back(type.get<std::string>() == "full_attention" ? (int32_t) n_head_kv : 0);
+    }
+    if (n_kv.size() != n_layer) {
+        throw std::runtime_error("layer_types does not match num_hidden_layers");
+    }
+
+    // same adjustment as the dense lfm2 converter
+    uint32_t n_ff = st_json_value(cfg, "block_ff_dim", st_json_value(cfg, "intermediate_size", 0u));
+    if (!moe && st_json_value(cfg, "block_auto_adjust_ff_dim", false)) {
+        n_ff = (uint32_t) (2 * n_ff / 3);
+        if (st_json_set(cfg, "block_ffn_dim_multiplier")) {
+            n_ff = (uint32_t) (cfg.at("block_ffn_dim_multiplier").get<double>() * n_ff);
+        }
+        const uint32_t multiple_of = st_json_value(cfg, "block_multiple_of", 1u);
+        n_ff = multiple_of * ((n_ff + multiple_of - 1) / multiple_of);
+    }
+
+    const json rope = st_json_value(cfg, "rope_parameters", json::object());
+
+    gguf_set_val_str(meta, "general.architecture", a.c_str());
+    gguf_set_val_str(meta, "general.name",         dir_name.c_str());
+    gguf_set_val_str(meta, "general.type",         "model");
+
+    add_u32("block_count",         n_layer);
+    add_u32("context_length",      st_json_value(cfg, "max_position_embeddings", 128000u));
+    add_u32("embedding_length",    st_json_value(cfg, "hidden_size", 0u));
+    add_u32("feed_forward_length", n_ff);
+    add_u32("vocab_size",          st_json_value(cfg, "vocab_size", 0u));
+    add_u32("attention.head_count", n_head);
+    gguf_set_arr_data(meta, (a + ".attention.head_count_kv").c_str(), GGUF_TYPE_INT32, n_kv.data(), n_kv.size());
+    add_f32("attention.layer_norm_rms_epsilon", st_json_value(cfg, "norm_eps", 1e-5f));
+    add_f32("rope.freq_base", st_json_value(rope, "rope_theta", st_json_value(cfg, "rope_theta", 1000000.0f)));
+    add_u32("shortconv.l_cache", st_json_value(cfg, "conv_L_cache", 3u));
+
+    if (moe) {
+        add_u32("expert_count",               st_json_value(cfg, "num_experts", 0u));
+        add_u32("expert_used_count",          st_json_value(cfg, "num_experts_per_tok", 0u));
+        add_u32("expert_feed_forward_length", st_json_value(cfg, "moe_intermediate_size", 0u));
+        add_u32("leading_dense_block_count",  st_json_value(cfg, "num_dense_layers", 0u));
+        add_u32("expert_gating_func",         LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID);
+    }
+}
+
 static void st_build_plans(st_loader & L, gguf_context * meta, const fs::path & dir, const json & cfg, enum st_mode mode,
         enum st_map_kind kind, const st_generic_arch * gen) {
     const json & tc = cfg.contains("text_config") ? cfg.at("text_config") : cfg;
@@ -3246,6 +3399,7 @@ static void st_build_plans(st_loader & L, gguf_context * meta, const fs::path & 
             case ST_MAP_GENERIC: mapped = st_map_tensor_generic(base_name, n_layer, *gen, m, expert, expert_base); break;
             case ST_MAP_NEMOTRON: mapped = st_map_tensor_nemotron(base_name, L.ssm_groups, m, expert, expert_base); break;
             case ST_MAP_XING4_0:  mapped = st_map_tensor_xing4_0(base_name, n_layer, m, expert, expert_base); break;
+            case ST_MAP_LFM2:     mapped = st_map_tensor_lfm2(base_name, m, expert, expert_base); break;
         }
         if (!mapped) {
             n_skipped++;
@@ -3701,6 +3855,7 @@ struct llama_model * common_safetensors_load_model(const std::string & path, con
         const bool moe = model_type == "qwen3_5_moe";
         const bool native_qwen = model_type == "qwen3_5" || moe || model_type == "agnes" || prism_hadamard;
         const bool gemma4 = !native_qwen && (model_type == "gemma4_unified" || model_type == "gemma4");
+        const bool lfm2 = model_type == "lfm2" || model_type == "lfm2_moe";
         // the nemotron-h family nests its text configuration in llm_config, its values win over the top level
         const bool nemotron = !native_qwen && !gemma4 && model_type.rfind("NemotronH", 0) == 0;
         json cfg_text = cfg;
@@ -3709,11 +3864,11 @@ struct llama_model * common_safetensors_load_model(const std::string & path, con
                 cfg_text[key] = value;
             }
         }
-        const st_generic_arch * generic = (native_qwen || gemma4 || nemotron) ? nullptr : st_generic_lookup(cfg);
+        const st_generic_arch * generic = (native_qwen || gemma4 || nemotron || lfm2) ? nullptr : st_generic_lookup(cfg);
         // xing4.0 is a deepseek style MLA + MoE model with mHC residual streams, driven by config keys
-        const bool xing4_0 = !native_qwen && !gemma4 && !nemotron && generic == nullptr &&
+        const bool xing4_0 = !native_qwen && !gemma4 && !nemotron && !lfm2 && generic == nullptr &&
             st_json_set(cfg, "hc_mult") && st_json_set(cfg, "q_lora_rank") && st_json_set(cfg, "n_routed_experts");
-        if (!native_qwen && !gemma4 && !nemotron && !xing4_0 && generic == nullptr) {
+        if (!native_qwen && !gemma4 && !nemotron && !lfm2 && !xing4_0 && generic == nullptr) {
             throw std::runtime_error("unsupported safetensors architecture: " + model_type +
                     " (no mapping for it, and no generic decoder mapping either - convert this checkpoint to GGUF first)");
         }
@@ -3752,6 +3907,11 @@ struct llama_model * common_safetensors_load_model(const std::string & path, con
             st_add_meta_gemma4(meta, cfg, dir.filename().string());
             st_add_meta_vocab(meta, dir, cfg, ST_VOCAB_GEMMA4);
             st_build_plans(*L, meta, dir, cfg, mode, ST_MAP_GEMMA4, nullptr);
+        } else if (lfm2) {
+            st_parse_quant_config(*L, cfg);
+            st_add_meta_lfm2(meta, cfg, dir.filename().string(), model_type == "lfm2_moe");
+            st_add_meta_vocab(meta, dir, cfg, ST_VOCAB_LFM2);
+            st_build_plans(*L, meta, dir, cfg, mode, ST_MAP_LFM2, nullptr);
         } else if (nemotron) {
             st_parse_quant_config(*L, cfg_text);
             st_add_meta_nemotron(*L, meta, cfg_text, dir.filename().string());

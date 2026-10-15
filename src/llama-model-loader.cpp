@@ -1758,7 +1758,7 @@ std::vector<llama_model_loader::mapping_range> llama_model_loader::get_mapping_r
 
         for (ggml_tensor * tensor = ggml_get_first_tensor(it.second.get()); tensor; tensor = ggml_get_next_tensor(it.second.get(), tensor)) {
             const auto * weight = get_weight(ggml_get_name(tensor));
-            if (!weight || weight->idx != idx || own.count(weight)) {
+            if (!weight || weight->idx != idx || weight->is_provided || own.count(weight)) {
                 continue;
             }
             other.push_back({ weight->offs, weight->offs + ggml_nbytes(tensor) });
