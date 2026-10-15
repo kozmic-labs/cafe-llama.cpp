@@ -466,7 +466,7 @@ int main(int argc, char ** argv) {
             }
             cinputs.enable_thinking       = false;
             cinputs.add_generation_prompt = true;
-            text                          = common_chat_templates_apply(tmpls.get(), cinputs).prompt;
+            text                          = common_chat_templates_apply(tmpls.get(), cinputs).prompt.str();
         }
 
         std::vector<llama_token> inp =

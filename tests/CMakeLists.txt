@@ -354,6 +354,7 @@ llama_build_and_test(test-ptq1_0-cuda-dot.cpp)
     llama_build_and_test(test-quantize-perf.cpp LINK ggml)
     llama_build_and_test(test-rope.cpp LINK ggml)
     llama_build_and_test(test-col2im-1d.cpp LINK ggml)
+    llama_build_and_test(test-conv-1d.cpp LINK ggml)
 endif()
 
 # libmtmd
